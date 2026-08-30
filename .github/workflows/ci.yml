@@ -1,0 +1,276 @@
+# Один workflow, а не несколько файлов: проверки, сборка и релиз отличаются только
+# условием запуска, а держать их вместе гарантирует, что релиз не соберётся из
+# кода, который не прошёл проверки.
+#
+# Приложение собирается ТОЛЬКО здесь. Локальная сборка остаётся способом
+# посмотреть, что получилось, но источник релиза — артефакты этого конвейера:
+# иначе «у меня собиралось» однажды разойдётся с тем, что скачал человек.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Версия ruff закреплена намеренно: без этого его обновление добавляет новые
+      # правила и роняет сборку на коде, который никто не трогал.
+      - name: Установить инструменты
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.16.5 pyyaml
+
+      - name: Синтаксис Python
+        run: python -m compileall -q app
+
+      - name: Линтер
+        run: ruff check app
+
+      # У приложения зависимостей нет вовсе, поэтому обе самопроверки запускаются
+      # на голом Python — ставить перед ними нечего.
+      - name: Самопроверка разбора статусов
+        run: cd app && python media.py
+
+      - name: Самопроверка путей и шаблона томов
+        run: cd app && python install.py
+
+      - name: Синтаксис YAML
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+          bad = 0
+          files = (list(pathlib.Path('k8s').rglob('*.yaml'))
+                   + list(pathlib.Path('deploy').rglob('*.yaml'))
+                   + list(pathlib.Path('ansible').rglob('*.yml')))
+          for p in files:
+              try:
+                  # Многодокументные манифесты требуют safe_load_all, а не safe_load.
+                  list(yaml.safe_load_all(p.read_text()))
+              except yaml.YAMLError as e:
+                  print(f'{p}: {e}'); bad += 1
+          print(f'проверено файлов: {len(files)}')
+          sys.exit(bad)
+          PY
+
+      # Шаблон томов сам по себе не YAML (в нём плейсхолдеры), поэтому проверяется
+      # заполненным. Здесь же ловится лишняя фигурная скобка в комментарии: она
+      # сломала бы format() уже на машине пользователя.
+      - name: Шаблон томов разворачивается в валидный YAML
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+          sys.path.insert(0, 'app')
+          import install
+          docs = list(yaml.safe_load_all(
+              install.render_volumes(pathlib.Path('/tmp/cfg'), pathlib.Path('/tmp/media'))))
+          docs = [d for d in docs if d]
+          assert len(docs) == 7, f'томов должно быть 7, а вышло {len(docs)}'
+          assert {d['spec']['claimRef']['name'] for d in docs} == {
+              'nfs-media', 'jellyfin-config', 'jellyseerr-config', 'sonarr-config',
+              'radarr-config', 'prowlarr-config', 'qbittorrent-config'}
+          print('шаблон томов: 7 томов, заявки на месте')
+          PY
+
+      - name: Синтаксис bash
+        run: |
+          for f in infra/vms/scripts/*.sh; do bash -n "$f"; done
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck infra/vms/scripts/*.sh
+
+      # kustomize встроен в kubectl; проверяем, что оверлей k3s собирается и что из
+      # него не просочился nodeSelector стенда — с ним поды у пользователя повисли бы
+      # в Pending навсегда.
+      - name: Оверлей k3s собирается
+        run: |
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          ./kubectl kustomize deploy/k3s > /tmp/k3s.yaml
+          test "$(grep -c '^kind:' /tmp/k3s.yaml)" -eq 20
+          ! grep -q nodeSelector /tmp/k3s.yaml
+          ! grep -q 'storageClassName: nfs' /tmp/k3s.yaml
+          # Ни одной заявки на local-path: тома статические, их готовит установщик.
+          # Пропусти это — и данные тихо уедут в /var/lib/rancher вместо папки,
+          # которую выбрал пользователь.
+          ! grep -q 'storageClassName: local-path' /tmp/k3s.yaml
+          test "$(grep -c 'storageClassName: ""' /tmp/k3s.yaml)" -eq 7
+
+      # Главный риск проекта: формы развёртывания расходятся, и адрес сервиса у
+      # пользователя перестаёт совпадать с документацией и текстами приложения.
+      # Эта проверка — единственное, что этому мешает. Не удаляй её.
+      - name: Порты k3s совпадают с app/config.py
+        run: |
+          python - <<'PY'
+          import subprocess, sys, yaml
+          sys.path.insert(0, 'app')
+          import config
+
+          want = {s.port: s.internal_port for s in config.SERVICES}
+          rendered = subprocess.run(['./kubectl', 'kustomize', 'deploy/k3s'],
+                                    capture_output=True, text=True, check=True).stdout
+          k3s = {p['nodePort']: p['targetPort']
+                 for d in yaml.safe_load_all(rendered) if d and d['kind'] == 'Service'
+                 for p in d['spec']['ports']}
+          assert k3s == want, f'k3s разошёлся: {k3s} != {want}'
+          print('порты k3s совпадают с app/config.py')
+          PY
+
+      # Головы у раннера нет, поэтому окно собирается в виртуальном X-сервере.
+      # Проверка грубая, но ловит то, что ломается чаще всего: опечатку в имени
+      # виджета или обращение к атрибуту, которого ещё нет.
+      - name: Окно приложения собирается
+        run: |
+          sudo apt-get install -y -qq xvfb
+          xvfb-run -a python - <<'PY'
+          import sys
+          sys.path.insert(0, 'app')
+          import ui
+          app = ui.App()
+          app.update()
+          assert app.notebook.index('end') == 4, 'вкладок должно быть четыре'
+          app.destroy()
+          print('окно собирается, вкладок 4')
+          PY
+
+  # Первая в проекте проверка продукта целиком: настоящий k3s, настоящие образы,
+  # настоящие ответы сервисов. До неё «работает» означало «работало на машине автора».
+  e2e:
+    needs: check
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Ставим k3s заранее сами: внутри приложения это делает pkexec, а на раннере
+      # некому нажать «разрешить». Всё остальное дальше делает сам установщик.
+      - name: Поставить k3s
+        run: |
+          curl -sfL https://get.k3s.io | \
+            sudo INSTALL_K3S_EXEC="--write-kubeconfig-mode 0644" sh -
+
+      - name: Установка тем же кодом, что у пользователя
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, 'app')
+          import install
+          home = pathlib.Path.home()
+          result = install.install('simple', home / 'hm-config', home / 'hm-media',
+                                   on_line=print)
+          assert result['ok'], 'установка вернула ok=False'
+          assert result['qbittorrent_password'], 'пароль качалки не создан'
+          PY
+
+      - name: Тома связались с заявками
+        run: |
+          sudo k3s kubectl get pvc -n media
+          test "$(sudo k3s kubectl get pvc -n media -o jsonpath='{.items[*].status.phase}' | tr ' ' '\n' | grep -c Bound)" -eq 7
+
+      - name: Поды поднялись
+        run: |
+          sudo k3s kubectl wait --for=condition=Ready pod --all -n media --timeout=900s
+          sudo k3s kubectl get pods -n media
+
+      # Опрашиваем сервисы тем же кодом, которым это делает окно приложения:
+      # проверяем продукт, а не отдельную выдумку для CI.
+      - name: Все шесть сервисов отвечают
+        run: |
+          python - <<'PY'
+          import sys, time
+          sys.path.insert(0, 'app')
+          import media
+          for attempt in range(10):          # сервисам нужно время на первый старт
+              statuses = media.service_status()
+              if all(s['alive'] for s in statuses):
+                  break
+              time.sleep(15)
+          for s in statuses:
+              print(f"{s['title']}: {s['text']}")
+          assert all(s['alive'] for s in statuses), 'не все сервисы отвечают'
+          PY
+
+      - name: Что было в логах, если упало
+        if: failure()
+        run: |
+          sudo k3s kubectl get pods,pvc,pv -n media
+          sudo k3s kubectl describe pods -n media | tail -100
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false        # сборка под одну ОС не должна прятать результат другой
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: home-media-k3s-linux
+          - os: windows-latest
+            asset: home-media-k3s-windows.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Собрать бандл
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller==6.22.2
+          pyinstaller --clean --noconfirm home-media-k3s.spec
+
+      # Один файл на каждую ОС: человек скачивает и запускает. Манифесты уже внутри
+      # бандла, отдельно их качать не нужно.
+      - name: Переименовать под ОС
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/home-media-k3s.exe "dist/${{ matrix.asset }}"
+          else
+            mv dist/home-media-k3s "dist/${{ matrix.asset }}"
+          fi
+
+      # Единственная проверка Windows-ветки, которую вообще можно автоматизировать:
+      # что собранное окно открывается. Цепочка WSL2 на раннере не проверяется.
+      - name: Окно собирается (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -c "import sys; sys.path.insert(0,'app'); import ui; a=ui.App(); a.update(); a.destroy(); print('ok')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [check, e2e, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      # Пересборки здесь нет специально: выкладывается ровно то, что прошло
+      # проверки и e2e, а не собранное заново из тех же исходников.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Скачайте файл под свою систему и запустите — откроется окно установки.
+
+            Linux: нужен systemd, всё остальное программа поставит сама.
+            Windows: программа сама включит WSL2 и поставит в него Linux;
+            понадобится подтверждение администратора и одна перезагрузка.

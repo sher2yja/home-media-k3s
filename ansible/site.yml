@@ -1,0 +1,9 @@
+# Полное разворачивание с нуля: VM + кластер + NFS.
+# Манифесты k8s применяются отдельно (см. CLAUDE.md) — они и так декларативны,
+# заворачивать kubectl apply в Ansible смысла нет.
+---
+- name: Провижининг VM
+  ansible.builtin.import_playbook: provision.yml
+
+- name: Настройка кластера
+  ansible.builtin.import_playbook: cluster.yml

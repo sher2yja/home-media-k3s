@@ -1,0 +1,7 @@
+# Только создание VM. Заменяет 00-host-prereqs.sh + 01-provision-vms.sh.
+---
+- name: Провижининг VM на libvirt
+  hosts: libvirt_host
+  gather_facts: true
+  roles:
+    - libvirt_vms

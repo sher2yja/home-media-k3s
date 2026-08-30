@@ -1,0 +1,55 @@
+# k3s-форма медиастека: оверлей над k8s/media-stack/, а не копия.
+#
+# Копия означала бы два источника истины на два десятка манифестов, которые обязаны
+# разъехаться. Разница между стендом и k3s мала и вся перечислена ниже. Применять:
+#   kubectl apply -k deploy/k3s
+# kustomize встроен в kubectl (v5.x), отдельной зависимости не появляется.
+#
+# ЧЕГО ЗДЕСЬ НЕТ по сравнению с k8s/media-stack/:
+#   10-local-path-storageclass.yaml — k3s несёт local-path из коробки и уже делает
+#     его default; повторное объявление конфликтует с его собственным манифестом;
+#   20-nfs-media-pv.yaml / 21-nfs-media-pvc.yaml — NFS-сервера на машине пользователя
+#     нет, тома берутся с локального диска (см. media-pvc.yaml и hostpath-volumes.yaml.tmpl).
+#
+# Мониторинг сюда не входит: k8s/monitoring/ применяется отдельно и на k3s работает
+# как есть (он ищет цели через kubernetes_sd, а не через имена нод стенда).
+#
+# Тома тоже нужно создать ДО применения: hostpath-volumes.yaml.tmpl — шаблон, куда
+# приложение подставляет выбранные пользователем папки. Без него заявки останутся
+# в Pending: динамического провижининга здесь больше нет (см. патч классов ниже).
+#
+# Secret qbittorrent-webui нужно создать ДО применения, иначе под не стартует:
+#   infra/vms/scripts/08-qbittorrent-secret.sh
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: media
+
+resources:
+  - ../../k8s/media-stack   # namespace + 6 сервисов, общая часть
+  - media-pvc.yaml             # хранилище: местное вместо NFS
+
+patches:
+  # Единственная правка деплойментов. На стенде вся нагрузка прибита к k8s-worker01,
+  # потому что control-plane под taint'ом, а NFS-том живёт на третьей VM. У
+  # пользователя нода одна и зовут её как его компьютер — с этим nodeSelector'ом
+  # поды остались бы Pending навсегда, без внятной ошибки.
+  - target:
+      kind: Deployment
+    patch: |
+      - op: remove
+        path: /spec/template/spec/nodeSelector
+
+  # Второй патч, третье и последнее расхождение с базой. На стенде конфиги живут
+  # который динамически нарезает тома на диске worker01. У пользователя тома —
+  # статические hostPath в выбранных им папках (hostpath-volumes.yaml.tmpl), и
+  # пустой класс здесь ровно это и означает: «провижинер, не трогай, том уже есть».
+  # Оставь local-path — и заявка уедет к нему, а подготовленный hostPath повиснет
+  # свободным. Ошибки при этом не будет, просто данные окажутся не там.
+  - target:
+      kind: PersistentVolumeClaim
+    patch: |
+      - op: add
+        path: /spec/storageClassName
+        value: ""

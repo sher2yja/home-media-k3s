@@ -1,0 +1,102 @@
+# Общая подготовка ноды + пакеты Kubernetes.
+# Раньше это жило в cp-user-data.yaml и worker-user-data.yaml — двумя копиями.
+---
+- name: Выключить swap на лету
+  ansible.builtin.command: swapoff -a
+  when: ansible_swaptotal_mb | default(0) > 0
+  changed_when: ansible_swaptotal_mb | default(0) > 0
+
+- name: Убрать swap из fstab (чтобы не вернулся после ребута)
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\sswap\s.*)$'
+    replace: '# \1'
+
+- name: Модули ядра для k8s
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+    mode: "0644"
+
+- name: Загрузить модули сейчас
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: [overlay, br_netfilter]
+
+- name: sysctl для сети k8s
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/k8s.conf
+    reload: true
+  loop:
+    - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+    - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+    - { name: net.ipv4.ip_forward, value: "1" }
+
+- name: Пакеты (nfs-common нужен на воркере под NFS-том media)
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+      - nfs-common
+      - containerd
+    state: present
+    update_cache: true
+
+- name: Каталог конфига containerd
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: "0755"
+
+- name: Дефолтный конфиг containerd
+  ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: SystemdCgroup=true (иначе kubelet и containerd разойдутся по cgroup-драйверу)
+  ansible.builtin.lineinfile:
+    path: /etc/containerd/config.toml
+    regexp: '^(\s*)SystemdCgroup\s*=\s*false\s*$'
+    line: '\1SystemdCgroup = true'
+    backrefs: true
+  notify: restart containerd
+
+- name: containerd включён и запущен
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started
+
+- name: Репозиторий Kubernetes
+  # deb822_repository сам скачивает и разоружает ключ — три отдельных таска
+  # (get_url + gpg --dearmor + apt_repository) больше не нужны
+  ansible.builtin.deb822_repository:
+    name: kubernetes
+    types: deb
+    uris: "https://pkgs.k8s.io/core:/stable:/{{ k8s_apt_channel }}/deb/"
+    suites: "/"
+    signed_by: "https://pkgs.k8s.io/core:/stable:/{{ k8s_apt_channel }}/deb/Release.key"
+    state: present
+
+- name: kubelet/kubeadm/kubectl строго одной версии
+  ansible.builtin.apt:
+    name:
+      - "kubelet={{ k8s_version }}-1.1"
+      - "kubeadm={{ k8s_version }}-1.1"
+      - "kubectl={{ k8s_version }}-1.1"
+    state: present
+    update_cache: true
+    allow_change_held_packages: true
+
+- name: Зафиксировать версии (apt-mark hold)
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [kubelet, kubeadm, kubectl]

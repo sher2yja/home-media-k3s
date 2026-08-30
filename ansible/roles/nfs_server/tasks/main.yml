@@ -1,0 +1,62 @@
+# NFS-экспорт для медиатеки. Заменяет nfs-user-data.yaml.
+# UID/GID 1000 обязаны совпадать с PUID/PGID контейнеров linuxserver.io,
+# иначе запись из пода тихо падает под root_squash.
+---
+- name: nfs-kernel-server
+  ansible.builtin.apt:
+    name: nfs-kernel-server
+    state: present
+    update_cache: true
+
+- name: Файловая система на диске данных
+  ansible.builtin.filesystem:
+    fstype: ext4
+    dev: /dev/vdb
+    opts: -L nfsdata
+
+- name: Точка монтирования и запись в fstab
+  ansible.posix.mount:
+    path: /srv/nfs/media
+    src: LABEL=nfsdata
+    fstype: ext4
+    opts: defaults
+    passno: "2"
+    state: mounted
+
+- name: Структура каталогов медиатеки
+  # Одинаковый путь /data у qbittorrent/sonarr/radarr/jellyfin — это то,
+  # что позволяет *arr делать hardlink вместо copy
+  ansible.builtin.file:
+    path: "/srv/nfs/media/{{ item }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0775"
+  loop:
+    - downloads
+    - library/tv
+    - library/movies
+
+- name: Владелец всего экспорта — 1000:1000
+  ansible.builtin.file:
+    path: /srv/nfs/media
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0775"
+
+- name: /etc/exports
+  # root_squash оставляем ОСОЗНАННО — негативный тест в 04-verify-nfs.sh
+  # проверяет, что root с воркера получает Permission denied
+  ansible.builtin.copy:
+    dest: /etc/exports
+    mode: "0644"
+    content: |
+      /srv/nfs/media 192.168.122.0/24(rw,sync,no_subtree_check,root_squash) {{ pod_network_cidr }}(rw,sync,no_subtree_check,root_squash)
+  notify: reload exports
+
+- name: nfs-kernel-server включён и запущен
+  ansible.builtin.systemd:
+    name: nfs-kernel-server
+    enabled: true
+    state: started

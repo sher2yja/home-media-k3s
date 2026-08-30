@@ -1,0 +1,40 @@
+# Единственное место, где живут версии и адреса. В bash-скриптах они были
+# продублированы в трёх файлах — это и было главной причиной переезда на Ansible.
+
+k8s_version: "1.35.7"
+k8s_apt_channel: "v1.35"          # репозиторий pkgs.k8s.io, минорная ветка
+pod_network_cidr: "10.244.0.0/16" # должен совпадать с манифестом Flannel
+local_path_version: "v0.0.30"
+
+libvirt_image_dir: /var/lib/libvirt/images
+ubuntu_base_image: noble-server-cloudimg-amd64.img
+ubuntu_image_url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+
+# Ключ не хардкодим в cloud-init, как было раньше
+ssh_public_key: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/id_ed25519.pub') }}"
+
+# Единый источник правды по VM: отсюда и DHCP-резервации, и virt-install
+vms:
+  - name: k8s-cp01
+    mac: "52:54:00:12:34:01"
+    ip: 192.168.122.11
+    memory: 2048
+    vcpus: 2
+    disk: 20G
+    extra_disk: false
+  - name: k8s-worker01
+    mac: "52:54:00:12:34:02"
+    ip: 192.168.122.12
+    # 4096 — потолок; мониторинг (Phase 5) в 3GiB уже не помещался
+    memory: 4096
+    vcpus: 3
+    disk: 40G
+    extra_disk: false
+  - name: k8s-nfs01
+    mac: "52:54:00:12:34:03"
+    ip: 192.168.122.13
+    memory: 1024
+    vcpus: 1
+    disk: 8G
+    extra_disk: true        # отдельный диск данных под NFS-экспорт
+    extra_disk_size: 20G

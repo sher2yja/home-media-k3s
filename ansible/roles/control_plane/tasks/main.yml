@@ -1,0 +1,101 @@
+# kubeadm init + Flannel + local-path. Заменяет первую половину 02-bootstrap-cluster.sh.
+---
+- name: Инициализирован ли уже control-plane
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf
+
+- name: kubeadm init
+  ansible.builtin.command: >-
+    kubeadm init
+    --apiserver-advertise-address={{ ansible_host }}
+    --pod-network-cidr={{ pod_network_cidr }}
+    --kubernetes-version=v{{ k8s_version }}
+    --node-name={{ inventory_hostname }}
+  when: not admin_conf.stat.exists
+
+- name: Дождаться готовности API-сервера
+  # kubeadm init возвращается раньше, чем apiserver начинает отвечать на /readyz
+  ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw /readyz
+  register: readyz
+  until: readyz.rc == 0
+  retries: 30
+  delay: 5
+  changed_when: false
+
+- name: kubeconfig для пользователя ubuntu
+  block:
+    - name: Каталог ~/.kube
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Скопировать admin.conf
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: true
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+
+- name: Установлен ли Flannel
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    -n kube-flannel get daemonset kube-flannel-ds
+  register: flannel_check
+  failed_when: false
+  changed_when: false
+
+- name: Flannel (CNI)
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f
+    https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+  when: flannel_check.rc != 0
+
+- name: Дождаться, пока нода станет Ready
+  # Без CNI нода висит в NotReady — ждём именно после установки Flannel
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+  changed_when: false
+
+- name: local-path-provisioner (upstream)
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f
+    https://raw.githubusercontent.com/rancher/local-path-provisioner/{{ local_path_version }}/deploy/local-path-storage.yaml
+  register: lpp
+  changed_when: "'created' in lpp.stdout"
+
+- name: Текущий StorageClass local-path
+  # Upstream-манифест local-path создаёт StorageClass БЕЗ is-default-class и
+  # перетирает её при КАЖДОМ apply — то есть при каждом прогоне этого плейбука.
+  # Без неё PVC без явного storageClassName не получат тома.
+  # Берём JSON целиком: в jsonpath пришлось бы экранировать точки в имени
+  # аннотации, а YAML съедает обратные слеши.
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf get storageclass local-path -o json
+  register: sc_json
+  changed_when: false
+
+- name: Пометить StorageClass как default
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf patch storageclass local-path
+    -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+  when: >-
+    (sc_json.stdout | from_json).metadata.annotations
+    | default({}, true)
+    | dict2items | selectattr('key', 'eq', 'storageclass.kubernetes.io/is-default-class')
+    | map(attribute='value') | first | default('') != 'true'
+
+- name: Токен для join
+  ansible.builtin.command: kubeadm token create --print-join-command
+  register: join_command
+  changed_when: false
+
+- name: Запомнить join-команду для воркеров
+  ansible.builtin.set_fact:
+    kubeadm_join: "{{ join_command.stdout }}"

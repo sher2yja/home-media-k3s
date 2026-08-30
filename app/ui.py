@@ -1,0 +1,498 @@
+"""Окно приложения: четыре вкладки вместо четырёх веб-страниц.
+
+Почему не браузер. Это программа для того, кто сидит за этим компьютером, а не
+сервис. Вкладку браузера человек закрывает и теряет, а веб-форма тянула четыре
+зависимости ради того, что Tk умеет из коробки. Теперь зависимостей нет вовсе.
+
+Главное правило этого файла: НИЧЕГО ДОЛГОГО В ПОТОКЕ ОКНА. Установка идёт минуты,
+опрос шести сервисов — до тридцати секунд; выполненные прямо в обработчике кнопки,
+они замораживают окно, и человек решает, что программа повисла. Всё долгое уходит
+в отдельный поток, а результат возвращается через очередь, которую разбирает
+after() — только так к виджетам обращается один и тот же поток, как требует Tk.
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
+import tkinter as tk
+import webbrowser
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+import config
+import install
+import media
+
+PAD = 10
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Домашний медиасервер")
+        self.geometry("820x680")
+        self.minsize(660, 520)
+
+        # Вместо cookie с токеном Jellyfin: приложение однопользовательское и
+        # живёт до закрытия, хранить вход между запусками незачем.
+        self.jellyfin_user: str | None = None
+        self.jellyfin_name: str | None = None
+
+        self._events: queue.Queue = queue.Queue()
+        self._busy = False
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        self._build_setup_tab()
+        self._build_dashboard_tab()
+        self._build_movies_tab()
+        self._build_help_tab()
+
+        self.notebook.select(1 if config.installed() else 0)
+        self.after(100, self._drain)
+        if config.installed():
+            self.refresh_dashboard()
+        else:
+            self.refresh_checks()
+
+    # --- Фоновая работа -----------------------------------------------------
+
+    def _log(self, line: str) -> None:
+        """Вызывается из чужого потока — поэтому кладёт в очередь, а не в виджет."""
+        self._events.put(("line", line))
+
+    def run_bg(self, work, done) -> bool:
+        """work(log) выполняется в отдельном потоке, done(result) — в потоке окна.
+
+        Исключение не теряется и не всплывает в никуда: оно приезжает в done тем
+        же путём, что и нормальный результат, и там превращается в понятный текст.
+        """
+        if self._busy:
+            return False
+        self._busy = True
+        self._set_busy(True)
+
+        def worker() -> None:
+            try:
+                result = work(self._log)
+            except Exception as exc:  # noqa: BLE001 — до окна должна доехать любая
+                result = exc
+            self._events.put(("done", (done, result)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                kind, payload = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "line":
+                self._append_log(payload)
+            else:
+                self._busy = False
+                self._set_busy(False)
+                callback, result = payload
+                callback(result)
+        self.after(100, self._drain)
+
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for button in (self.install_button, self.recheck_button, self.repair_button):
+            button.configure(state=state)
+        if busy:
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+
+    def _append_log(self, line: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", line + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    # --- Вкладка «Установка» ------------------------------------------------
+
+    def _build_setup_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=PAD)
+        self.notebook.add(tab, text="Установка")
+
+        ttk.Label(tab, text="Установка домашнего медиасервера",
+                  font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        ttk.Label(tab, wraplength=760, foreground="#555", text=(
+            "Сначала проверим, всё ли готово на этом компьютере. Чего не хватает — "
+            "программа поставит сама; где понадобится подтверждение, она спросит."
+        )).pack(anchor="w", pady=(0, PAD))
+
+        self.checks_frame = ttk.LabelFrame(tab, text="Проверки", padding=PAD)
+        self.checks_frame.pack(fill="x")
+
+        self.recheck_button = ttk.Button(tab, text="Проверить снова",
+                                         command=self.refresh_checks)
+        self.recheck_button.pack(anchor="w", pady=(6, PAD))
+
+        profiles = ttk.LabelFrame(tab, text="Что установить", padding=PAD)
+        profiles.pack(fill="x")
+        self.profile = tk.StringVar(value=config.PROFILES[0].key)
+        for item in config.PROFILES:
+            ttk.Radiobutton(profiles, text=item.title, value=item.key,
+                            variable=self.profile).pack(anchor="w")
+            ttk.Label(profiles, text=item.blurb, wraplength=720,
+                      foreground="#555").pack(anchor="w", padx=(20, 0), pady=(0, 6))
+
+        folders = ttk.LabelFrame(tab, text="Куда складывать", padding=PAD)
+        folders.pack(fill="x", pady=(PAD, 0))
+        self.media_dir = self._folder_row(
+            folders, "Фильмы (эта папка вырастет до сотен гигабайт)",
+            config.default_media_dir())
+        self.config_dir = self._folder_row(
+            folders, "Настройки (небольшая папка, трогать не нужно)",
+            config.default_config_dir())
+
+        self.install_button = ttk.Button(tab, text="Установить", command=self.do_install)
+        self.install_button.pack(anchor="w", pady=PAD)
+        self.progress = ttk.Progressbar(tab, mode="indeterminate")
+        self.progress.pack(fill="x")
+
+        ttk.Label(tab, text="Что происходит:", foreground="#555").pack(
+            anchor="w", pady=(PAD, 2))
+        self.log = scrolledtext.ScrolledText(tab, height=10, state="disabled",
+                                             wrap="word")
+        self.log.pack(fill="both", expand=True)
+
+    def _folder_row(self, parent: ttk.Frame, label: str, default: Path) -> tk.StringVar:
+        ttk.Label(parent, text=label, foreground="#555").pack(anchor="w", pady=(6, 2))
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        var = tk.StringVar(value=str(default))
+        ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Выбрать…",
+                   command=lambda: self._pick_folder(var)).pack(side="left", padx=(6, 0))
+        return var
+
+    def _pick_folder(self, var: tk.StringVar) -> None:
+        chosen = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
+        if chosen:
+            var.set(chosen)
+
+    def refresh_checks(self) -> None:
+        for child in self.checks_frame.winfo_children():
+            child.destroy()
+        ttk.Label(self.checks_frame, text="Проверяю…").pack(anchor="w")
+        self.run_bg(lambda log: install.preflight(Path(self.media_dir.get())),
+                    self._show_checks)
+
+    def _show_checks(self, checks) -> None:
+        for child in self.checks_frame.winfo_children():
+            child.destroy()
+        if isinstance(checks, Exception):
+            ttk.Label(self.checks_frame, text=f"Не удалось проверить: {checks}",
+                      foreground="#b3261e", wraplength=740).pack(anchor="w")
+            return
+        for check in checks:
+            row = ttk.Frame(self.checks_frame)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text="✓" if check.ok else "✕", width=2,
+                      foreground="#1a7f37" if check.ok else "#b3261e").pack(side="left")
+            body = ttk.Frame(row)
+            body.pack(side="left", fill="x", expand=True)
+            ttk.Label(body, text=f"{check.title} — {check.detail}",
+                      wraplength=720).pack(anchor="w")
+            if not check.ok and check.fix:
+                ttk.Label(body, text=check.fix, foreground="#555",
+                          wraplength=720).pack(anchor="w")
+            if not check.ok and check.link:
+                self._link(body, check.link)
+
+    def _link(self, parent: ttk.Frame, url: str) -> None:
+        label = ttk.Label(parent, text=url, foreground="#0b57d0", cursor="hand2")
+        label.pack(anchor="w")
+        label.bind("<Button-1>", lambda _event: webbrowser.open(url))
+
+    def do_install(self) -> None:
+        media_dir = Path(self.media_dir.get())
+        config_dir = Path(self.config_dir.get())
+        profile = self.profile.get()
+        # Не пытаемся ставить поверх непройденных проверок: сообщение kubectl о
+        # том, почему не вышло, человеку ничего не скажет, а наши проверки — скажут.
+        failures = install.blocking_failures(install.preflight(media_dir))
+        if failures:
+            self._show_checks(install.preflight(media_dir))
+            messagebox.showwarning(
+                "Пока не всё готово",
+                "\n\n".join(f"{c.title}: {c.detail}\n{c.fix}" for c in failures))
+            return
+        self.run_bg(
+            lambda log: install.install(profile, config_dir, media_dir, on_line=log),
+            self._install_done)
+
+    def _install_done(self, result) -> None:
+        if isinstance(result, install.RebootRequired):
+            messagebox.showinfo("Нужна перезагрузка", str(result))
+            return
+        if isinstance(result, install.ManualStepRequired):
+            self._manual_step(result)
+            return
+        if isinstance(result, Exception):
+            messagebox.showerror("Не получилось", str(result))
+            return
+        if not result.get("ok"):
+            messagebox.showerror(
+                "Не получилось",
+                "Кластер сообщил вот что. Если ничего не понятно — это нормально, "
+                "покажите текст из окна ниже тому, кто ставил вам систему.")
+            return
+        password = result.get("qbittorrent_password")
+        if password:
+            self._password_dialog(password)
+        self.notebook.select(1)
+        self.refresh_dashboard()
+
+    def _manual_step(self, error: install.ManualStepRequired) -> None:
+        """Запасной путь на случай, когда прав получить не вышло: показать готовую
+        команду, а не оставить человека наедине с «отказано в доступе»."""
+        window = tk.Toplevel(self)
+        window.title("Нужно выполнить вручную")
+        frame = ttk.Frame(window, padding=PAD)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=str(error), wraplength=520).pack(anchor="w")
+        entry = ttk.Entry(frame, width=70)
+        entry.insert(0, error.command)
+        entry.configure(state="readonly")
+        entry.pack(fill="x", pady=PAD)
+        ttk.Button(frame, text="Скопировать команду",
+                   command=lambda: self._copy(error.command)).pack(anchor="w")
+
+    def _password_dialog(self, password: str) -> None:
+        window = tk.Toplevel(self)
+        window.title("Запишите пароль качалки")
+        frame = ttk.Frame(window, padding=PAD)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, wraplength=460, text=(
+            "Пароль понадобится, только если вы полезете в настройки качалки. "
+            "Логин admin, пароль:")).pack(anchor="w")
+        entry = ttk.Entry(frame, width=30, font=("TkFixedFont", 12))
+        entry.insert(0, password)
+        entry.configure(state="readonly")
+        entry.pack(pady=PAD)
+        ttk.Button(frame, text="Скопировать",
+                   command=lambda: self._copy(password)).pack(anchor="w")
+        ttk.Label(frame, foreground="#555", wraplength=460, text=(
+            "Пароль сохранён на этом компьютере, посмотреть снова можно на вкладке "
+            "«Как пользоваться».")).pack(anchor="w", pady=(PAD, 0))
+
+    def _copy(self, text: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    # --- Вкладка «Мой сервер» -----------------------------------------------
+
+    def _build_dashboard_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=PAD)
+        self.notebook.add(tab, text="Мой сервер")
+
+        ttk.Label(tab, text="Ваш медиасервер",
+                  font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        ttk.Label(tab, foreground="#555", wraplength=760, text=(
+            "Всё, что ниже, работает на этом компьютере — пока он включён."
+        )).pack(anchor="w", pady=(0, PAD))
+
+        self.services_frame = ttk.Frame(tab)
+        self.services_frame.pack(fill="both", expand=True)
+
+        buttons = ttk.Frame(tab)
+        buttons.pack(fill="x", pady=PAD)
+        ttk.Button(buttons, text="Обновить",
+                   command=self.refresh_dashboard).pack(side="left")
+        self.repair_button = ttk.Button(buttons, text="Перепроверить и починить",
+                                        command=self.do_repair)
+        self.repair_button.pack(side="left", padx=(6, 0))
+        ttk.Label(tab, foreground="#555", wraplength=760, text=(
+            "«Перепроверить и починить» возвращает сервисы к правильным настройкам. "
+            "Фильмы и настройки при этом не пропадают."
+        )).pack(anchor="w")
+
+    def refresh_dashboard(self) -> None:
+        for child in self.services_frame.winfo_children():
+            child.destroy()
+        ttk.Label(self.services_frame, text="Спрашиваю сервисы…").pack(anchor="w")
+        self.run_bg(lambda log: media.service_status(), self._show_services)
+
+    def _show_services(self, services) -> None:
+        for child in self.services_frame.winfo_children():
+            child.destroy()
+        if isinstance(services, Exception):
+            ttk.Label(self.services_frame, text=f"Не удалось опросить: {services}",
+                      foreground="#b3261e").pack(anchor="w")
+            return
+        for group, title in ((True, "Чем пользоваться"),
+                             (False, "Служебное — работает само")):
+            ttk.Label(self.services_frame, text=title,
+                      font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(PAD, 2))
+            for service in (s for s in services if s["user_facing"] is group):
+                self._service_row(service)
+
+    def _service_row(self, service: dict) -> None:
+        row = ttk.Frame(self.services_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="✓" if service["alive"] else "✕", width=2,
+                  foreground="#1a7f37" if service["alive"] else "#b3261e"
+                  ).pack(side="left")
+        ttk.Button(row, text=service["title"], width=14,
+                   command=lambda: webbrowser.open(service["url"])).pack(side="left")
+        ttk.Label(row, text=f"{service['text']}. {service['blurb']}", wraplength=600,
+                  foreground="#555").pack(side="left", padx=(8, 0))
+
+    def do_repair(self) -> None:
+        self.notebook.select(0)   # лог живёт на первой вкладке — переключаемся к нему
+        self.run_bg(lambda log: install.repair(on_line=log), self._repair_done)
+
+    def _repair_done(self, result) -> None:
+        if isinstance(result, Exception):
+            messagebox.showerror("Не получилось", str(result))
+            return
+        messagebox.showinfo(
+            "Готово" if result.get("ok") else "Не получилось",
+            "Сервисы приведены к правильным настройкам." if result.get("ok")
+            else "Подробности — в окне «Что происходит» на вкладке «Установка».")
+        self.notebook.select(1)
+        self.refresh_dashboard()
+
+    # --- Вкладка «Где мой фильм» --------------------------------------------
+
+    def _build_movies_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=PAD)
+        self.notebook.add(tab, text="Где мой фильм")
+
+        ttk.Label(tab, text="Где мой фильм",
+                  font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+
+        self.login_frame = ttk.LabelFrame(tab, text="Вход", padding=PAD)
+        self.login_frame.pack(fill="x", pady=(PAD, 0))
+        ttk.Label(self.login_frame, wraplength=740, text=(
+            "Войдите тем же логином и паролем, что и в Jellyfin — тогда увидите "
+            "свои заказы. Отдельной учётной записи здесь нет: аккаунты живут в "
+            "Jellyfin, программа просто спрашивает у него."
+        )).pack(anchor="w", pady=(0, 6))
+        self.jf_login = tk.StringVar()
+        self.jf_password = tk.StringVar()
+        form = ttk.Frame(self.login_frame)
+        form.pack(anchor="w")
+        ttk.Label(form, text="Логин").grid(row=0, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.jf_login, width=24).grid(row=0, column=1)
+        ttk.Label(form, text="Пароль").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(form, textvariable=self.jf_password, show="•", width=24).grid(
+            row=1, column=1, pady=(4, 0))
+        ttk.Button(form, text="Войти", command=self.do_login).grid(
+            row=0, column=2, rowspan=2, padx=(8, 0))
+
+        ttk.Button(tab, text="Обновить", command=self.refresh_movies).pack(
+            anchor="w", pady=PAD)
+        self.movies_frame = ttk.Frame(tab)
+        self.movies_frame.pack(fill="both", expand=True)
+
+    def do_login(self) -> None:
+        login, password = self.jf_login.get(), self.jf_password.get()
+        self.run_bg(lambda log: media.jellyfin_login(login, password),
+                    self._login_done)
+
+    def _login_done(self, who) -> None:
+        if isinstance(who, Exception) or not who or not who.get("user_id"):
+            messagebox.showwarning("Не вышло войти",
+                                   "Jellyfin не принял этот логин или пароль.")
+            return
+        self.jellyfin_user = who["user_id"]
+        self.jellyfin_name = who.get("name") or self.jf_login.get()
+        self.jf_password.set("")
+        self.login_frame.pack_forget()
+        self.refresh_movies()
+
+    def refresh_movies(self) -> None:
+        for child in self.movies_frame.winfo_children():
+            child.destroy()
+        ttk.Label(self.movies_frame, text="Смотрю, что качается…").pack(anchor="w")
+        state = config.load_state()
+        config_dir = Path(state.get("config_dir") or config.default_config_dir())
+        self.run_bg(
+            lambda log: media.where_is_my_movie(
+                config_dir, jellyfin_user_id=self.jellyfin_user),
+            self._show_movies)
+
+    def _show_movies(self, items) -> None:
+        for child in self.movies_frame.winfo_children():
+            child.destroy()
+        if isinstance(items, Exception):
+            ttk.Label(self.movies_frame, text=f"Не удалось спросить: {items}",
+                      foreground="#b3261e").pack(anchor="w")
+            return
+        if not items:
+            ttk.Label(self.movies_frame, wraplength=740, text=(
+                "Сейчас ничего не качается.\n\nЕсли вы только что заказали фильм — "
+                "подождите пару минут: система сначала ищет, где его взять. "
+                "Заказы делаются в Jellyseerr."
+            )).pack(anchor="w")
+            return
+        for item in items:
+            row = ttk.Frame(self.movies_frame)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=item["title"], font=("TkDefaultFont", 10, "bold"),
+                      wraplength=400).pack(side="left")
+            ttk.Label(row, text=item["status"], wraplength=320,
+                      foreground="#1a7f37" if item["done"] else "#555").pack(
+                          side="left", padx=(8, 0))
+
+    # --- Вкладка «Как пользоваться» -----------------------------------------
+
+    def _build_help_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=PAD)
+        self.notebook.add(tab, text="Как пользоваться")
+        self.help_text = scrolledtext.ScrolledText(tab, wrap="word", state="disabled")
+        self.help_text.pack(fill="both", expand=True)
+        command = " ".join(install.kubectl_command("get", "pods", "-n", "media"))
+        ttk.Button(tab, text="Скопировать команду состояния",
+                   command=lambda: self._copy(command)).pack(anchor="w", pady=(PAD, 0))
+        self._fill_help(command)
+
+    def _fill_help(self, command: str) -> None:
+        state = config.load_state()
+        password = state.get("qbittorrent_password")
+        profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
+        blocks = [
+            "ПОСМОТРЕТЬ ФИЛЬМ",
+            "1. Откройте Jellyfin на вкладке «Мой сервер».",
+            "2. Выберите фильм и нажмите «Смотреть».",
+            "",
+            ("С телевизора или телефона: установите приложение Jellyfin и укажите "
+             "ему адрес этого компьютера в домашней сети, порт 30096."),
+            "",
+            "ЗАКАЗАТЬ ФИЛЬМ, КОТОРОГО НЕТ",
+            "1. Откройте Jellyseerr на вкладке «Мой сервер».",
+            "2. Найдите фильм или сериал через поиск и нажмите «Запросить».",
+            "",
+            ("Дальше система ищет и качает сама. Следить за этим — на вкладке "
+             "«Где мой фильм»."),
+            "",
+        ]
+        if password:
+            blocks += ["ПАРОЛЬ КАЧАЛКИ",
+                       f"Логин admin, пароль {password}.",
+                       "Нужен, только если вы настраиваете qBittorrent руками.", ""]
+        if profile and profile.with_monitoring:
+            blocks += ["ГРАФИКИ НАГРУЗКИ",
+                       f"Grafana: {config.service_url(config.GRAFANA)}",
+                       config.GRAFANA.blurb, ""]
+        blocks += [
+            "ЕСЛИ ПОНАДОБИЛАСЬ КОМАНДНАЯ СТРОКА",
+            ("Обычно она не нужна — всё делается кнопками. Но если вас попросили "
+             "выполнить команду, вот та, что показывает состояние сервисов:"),
+            "",
+            f"    {command}",
+            "",
+            "Она ничего не меняет — только выводит список работающих сервисов.",
+        ]
+        self.help_text.configure(state="normal")
+        self.help_text.delete("1.0", "end")
+        self.help_text.insert("1.0", "\n".join(blocks))
+        self.help_text.configure(state="disabled")

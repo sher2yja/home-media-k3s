@@ -1,0 +1,38 @@
+# ОБЩАЯ часть медиастека: namespace и шесть сервисов. Хранилища здесь намеренно нет —
+# оно у каждой формы развёртывания своё, и это главное, чем формы отличаются:
+#
+#   стенд (kubeadm) -> 20-nfs-media-pv.yaml + 21-nfs-media-pvc.yaml (RWX по NFS)
+#   k3s             -> deploy/k3s/media-pvc.yaml + hostpath-volumes.yaml.tmpl,
+#                      тома указывают на папки, которые выбрал пользователь
+#
+# Файл существует ради deploy/k3s/: kustomize умеет ссылаться на чужой каталог только
+# если в нём есть kustomization.yaml. Развёртывание стенда его не использует и идёт
+# по-прежнему через kubectl apply -R -f по каталогам сервисов (см. CLAUDE.md).
+#
+# Файлы перечислены поимённо, а не каталогами, СПЕЦИАЛЬНО: каталог для kustomize —
+# это база, и ему нужен свой kustomization.yaml внутри. А такой файл в каталоге
+# сервиса ломает apply -R -f стенда — он попытается применить его как манифест.
+# Проверено, падает с 'no matches for kind Kustomization'.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - jellyfin/deployment.yaml
+  - jellyfin/pvc.yaml
+  - jellyfin/service.yaml
+  - jellyseerr/deployment.yaml
+  - jellyseerr/pvc.yaml
+  - jellyseerr/service.yaml
+  - prowlarr/deployment.yaml
+  - prowlarr/pvc.yaml
+  - prowlarr/service.yaml
+  - qbittorrent/deployment.yaml
+  - qbittorrent/pvc.yaml
+  - qbittorrent/service.yaml
+  - radarr/deployment.yaml
+  - radarr/pvc.yaml
+  - radarr/service.yaml
+  - sonarr/deployment.yaml
+  - sonarr/pvc.yaml
+  - sonarr/service.yaml

@@ -1,0 +1,169 @@
+# Тома для машины пользователя. ШАБЛОН: приложение подставляет сюда пути, которые
+# человек выбрал в окне установки, и применяет результат ДО оверлея.
+#
+# ПОЧЕМУ hostPath, а не local-path, который k3s несёт из коробки.
+# local-path кладёт данные в /var/lib/rancher/k3s/storage/<uuid-тома>/ — то есть НЕ
+# туда, куда пользователь показал пальцем. Для медиатеки это сразу неверно: папка с
+# фильмами должна лежать там, где её видно и можно скопировать на другой диск.
+# Для конфигов это ломает ещё и приложение: media.py читает ключи API прямо из
+# <config_dir>/<сервис>/config.xml, и с непредсказуемым путём экран «где мой фильм»
+# перестаёт работать. hostPath — это ровно тот bind-mount, что был в compose-форме:
+# пути внутри контейнеров те же, снаружи предсказуемые.
+#
+# ПОЧЕМУ claimRef + storageClassName: "" у каждого тома.
+# Так PV намертво закрепляется за одним конкретным PVC. Без claimRef семь одинаковых
+# по классу томов разобрались бы по заявкам в произвольном порядке, и конфиг Sonarr
+# однажды приехал бы в папку Radarr. Пустой класс к тому же выключает динамический
+# провижининг: local-path не перехватит заявку.
+#
+# ПОЧЕМУ type: Directory, а не DirectoryOrCreate.
+# Каталоги создаёт приложение от имени пользователя (install.prepare_dirs). Если бы
+# их создавал kubelet, владельцем стал бы root, а контейнеры linuxserver.io работают
+# под PUID=1000 и молча не смогли бы туда писать. Пусть лучше том не поднимется с
+# внятной ошибкой, чем поднимется и не будет писать.
+#
+# Retain у медиатомa: удаление PVC не должно сносить фильмы. У конфигов Delete
+# смысла тоже не имеет — hostPath-тома вообще не удаляются провижинером, но политика
+# пишется явно, чтобы никто не гадал.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: media-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 100Gi          # цифра условная: hostPath место не режет, но должна
+                            # быть не меньше запроса в PVC, иначе тома не свяжутся
+  accessModes:
+    - ReadWriteOnce         # RWO ограничивает одной НОДОЙ, а не одним подом:
+                            # нода здесь одна, все четыре пода монтируют том разом
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: nfs-media         # имя заявки историческое, NFS тут нет; см. media-pvc.yaml
+  hostPath:
+    path: {media}
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: jellyfin-config-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: jellyfin-config
+  hostPath:
+    path: {jellyfin}
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: jellyseerr-config-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: jellyseerr-config
+  hostPath:
+    path: {jellyseerr}
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: sonarr-config-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: sonarr-config
+  hostPath:
+    path: {sonarr}
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: radarr-config-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: radarr-config
+  hostPath:
+    path: {radarr}
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: prowlarr-config-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: prowlarr-config
+  hostPath:
+    path: {prowlarr}
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: qbittorrent-config-hostpath
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: media
+    name: qbittorrent-config
+  hostPath:
+    path: {qbittorrent}
+    type: Directory

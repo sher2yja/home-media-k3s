@@ -1,0 +1,15 @@
+# Source material (not project content)
+*.pdf
+
+# Secrets
+.env
+*.vpn
+
+# Temp
+tmp/
+__pycache__/
+.DS_Store
+
+# Собранные архивы для передачи (media-lite-windows.zip и т.п.) — генерируются
+# из lite/, не источник истины, не коммитим
+*.zip

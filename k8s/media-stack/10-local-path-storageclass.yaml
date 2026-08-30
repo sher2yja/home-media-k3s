@@ -1,0 +1,15 @@
+# SHORTCUT: local-path-provisioner хранит на k8s-worker01, без резервирования, привязано к ноде.
+# Заменить на NFS StorageClass в Phase 3 (shared storage) — см. docs/shortcuts.md.
+#
+# Провижинер (deployment/rbac/configmap) ставится отдельно из upstream-манифеста
+# (infra/vms/scripts/02-bootstrap-cluster.sh). Этот файл переопределяет только сам
+# объект StorageClass, добавляя annotation is-default-class — применять после апстрима.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete

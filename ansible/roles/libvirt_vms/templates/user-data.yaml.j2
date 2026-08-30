@@ -1,0 +1,21 @@
+#cloud-config
+# Минимальный cloud-init: только то, без чего Ansible не сможет зайти.
+# Всё остальное (containerd, kubeadm, NFS) ставят роли — раньше это было
+# продублировано здесь и в bash-скриптах.
+hostname: {{ item.name }}
+fqdn: {{ item.name }}
+
+users:
+  - name: ubuntu
+    gecos: ubuntu
+    shell: /bin/bash
+    # SHORTCUT: NOPASSWD нужен, чтобы Ansible ходил become без пароля.
+    # См. docs/shortcuts.md §1 — снимается вместе с переездом на постоянное железо.
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - {{ ssh_public_key }}
+
+package_update: true
+packages:
+  - python3

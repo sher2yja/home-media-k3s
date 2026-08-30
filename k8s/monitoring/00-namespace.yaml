@@ -1,0 +1,12 @@
+# Namespace для мониторинга.
+#
+# Prometheus не скрейпит поды media напрямую: Jellyfin, *arr и qBittorrent не отдают
+# Prometheus-метрики нативно. Метрики их контейнеров берутся из cAdvisor на kubelet.
+# Понадобится опрашивать сами приложения — появится exportarr рядом с *arr-сервисами,
+# и тогда его подхватит job annotated-pods без правки конфига.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: monitoring

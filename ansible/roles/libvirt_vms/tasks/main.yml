@@ -1,0 +1,181 @@
+# Заменяет 00-host-prereqs.sh и 01-provision-vms.sh.
+#
+# Принципиальное отличие от bash-версии: диски и ISO создаются через API пула
+# libvirt (virsh vol-*), а не записью в /var/lib/libvirt/images под sudo.
+# Пользователю из группы libvirt пароль root не нужен вообще — это важно, потому
+# что тот же код поедет на машины людей, которые sudo видят впервые.
+---
+- name: Проверить инструменты хоста
+  ansible.builtin.command: "which {{ item }}"
+  register: host_tools
+  changed_when: false
+  failed_when: false
+  loop: [virt-install, cloud-localds, qemu-img]
+
+- name: Доустановить недостающие пакеты (единственное место, где нужен sudo)
+  become: true
+  ansible.builtin.apt:
+    name: [virtinst, cloud-image-utils, genisoimage]
+    state: present
+    update_cache: true
+  when: host_tools.results | selectattr('rc', 'ne', 0) | list | length > 0
+
+- name: Текущий XML сети default
+  ansible.builtin.command: virsh net-dumpxml default
+  register: net_xml
+  changed_when: false
+
+- name: DHCP-резервации
+  # virsh net-update не идемпотентен: повторный add на тот же MAC падает
+  ansible.builtin.command: >-
+    virsh net-update default add ip-dhcp-host
+    "<host mac='{{ item.mac }}' name='{{ item.name }}' ip='{{ item.ip }}'/>"
+    --live --config
+  loop: "{{ vms }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.ip }}"
+  when: item.mac not in net_xml.stdout
+
+- name: Тома, уже существующие в пуле
+  # vol-list не поддерживает --name в этой версии libvirt, режем таблицу
+  ansible.builtin.shell: virsh vol-list default | awk 'NR>2 && NF {print $1}'
+  register: pool_vols
+  changed_when: false
+
+- name: Скачать базовый образ Ubuntu, если его нет в пуле
+  when: ubuntu_base_image not in pool_vols.stdout_lines
+  block:
+    - name: Загрузка образа во временный файл
+      ansible.builtin.get_url:
+        url: "{{ ubuntu_image_url }}"
+        dest: "/tmp/{{ ubuntu_base_image }}"
+        mode: "0644"
+
+    - name: Размер скачанного образа
+      ansible.builtin.stat:
+        path: "/tmp/{{ ubuntu_base_image }}"
+      register: base_img
+
+    - name: Создать том под базовый образ
+      ansible.builtin.command: >-
+        virsh vol-create-as default {{ ubuntu_base_image }}
+        {{ base_img.stat.size }} --format qcow2
+
+    - name: Залить образ в пул
+      ansible.builtin.command: >-
+        virsh vol-upload --pool default {{ ubuntu_base_image }}
+        /tmp/{{ ubuntu_base_image }}
+
+- name: Диски VM (qcow2-overlay поверх базового образа)
+  ansible.builtin.command: >-
+    virsh vol-create-as default {{ item.name }}.qcow2 {{ item.disk }}
+    --format qcow2
+    --backing-vol {{ ubuntu_base_image }}
+    --backing-vol-format qcow2
+  loop: "{{ vms }}"
+  loop_control:
+    label: "{{ item.name }}.qcow2 ({{ item.disk }})"
+  when: item.name + '.qcow2' not in pool_vols.stdout_lines
+
+- name: Диск данных NFS (без backing file — отдельно от OS-диска)
+  ansible.builtin.command: >-
+    virsh vol-create-as default {{ item.name }}-data.qcow2
+    {{ item.extra_disk_size }} --format qcow2
+  loop: "{{ vms | selectattr('extra_disk') | list }}"
+  loop_control:
+    label: "{{ item.name }}-data.qcow2"
+  when: item.name + '-data.qcow2' not in pool_vols.stdout_lines
+
+- name: Каталог для cloud-init
+  ansible.builtin.file:
+    path: /tmp/ansible-cloudinit
+    state: directory
+    mode: "0755"
+
+- name: Рендер user-data (один шаблон на все VM вместо трёх отдельных файлов)
+  ansible.builtin.template:
+    src: user-data.yaml.j2
+    dest: "/tmp/ansible-cloudinit/user-data-{{ item.name }}.yaml"
+    mode: "0644"
+  loop: "{{ vms }}"
+  loop_control:
+    label: "user-data для {{ item.name }}"
+
+- name: Положить network-config (одинаков для всех, шаблонить нечего)
+  ansible.builtin.copy:
+    src: network-config.yaml
+    dest: "/tmp/ansible-cloudinit/network-config-{{ item.name }}.yaml"
+    mode: "0644"
+  loop: "{{ vms }}"
+  loop_control:
+    label: "network-config для {{ item.name }}"
+
+- name: Собрать seed-ISO
+  ansible.builtin.command: >-
+    cloud-localds /tmp/ansible-cloudinit/seed-{{ item.name }}.iso
+    /tmp/ansible-cloudinit/user-data-{{ item.name }}.yaml
+    /tmp/ansible-cloudinit/network-config-{{ item.name }}.yaml
+  args:
+    creates: "/tmp/ansible-cloudinit/seed-{{ item.name }}.iso"
+  loop: "{{ vms }}"
+  loop_control:
+    label: "seed-{{ item.name }}.iso"
+
+- name: Какие домены уже определены
+  ansible.builtin.command: virsh list --all --name
+  register: existing_domains
+  changed_when: false
+
+- name: Залить seed-ISO в пул
+  # ISO пересобирается при каждом прогоне (cloud-localds не идемпотентен по
+  # содержимому), поэтому том пересоздаём всегда — он крошечный
+  ansible.builtin.shell: |
+    set -e
+    virsh vol-delete --pool default seed-{{ item.name }}.iso 2>/dev/null || true
+    SIZE=$(stat -c %s /tmp/ansible-cloudinit/seed-{{ item.name }}.iso)
+    virsh vol-create-as default seed-{{ item.name }}.iso "$SIZE" --format raw
+    virsh vol-upload --pool default seed-{{ item.name }}.iso \
+      /tmp/ansible-cloudinit/seed-{{ item.name }}.iso
+  loop: "{{ vms }}"
+  loop_control:
+    label: "seed-{{ item.name }}.iso"
+  when: item.name not in existing_domains.stdout_lines
+
+- name: Убрать устаревшие ключи из known_hosts
+  # VM пересоздаются, ключи меняются. Без этого ssh при следующем заходе
+  # пугает "REMOTE HOST IDENTIFICATION HAS CHANGED" — для неспециалиста это стена
+  ansible.builtin.known_hosts:
+    path: "{{ lookup('env', 'HOME') }}/.ssh/known_hosts"
+    name: "{{ item.ip }}"
+    state: absent
+  loop: "{{ vms }}"
+  loop_control:
+    label: "{{ item.ip }}"
+  when: item.name not in existing_domains.stdout_lines
+
+- name: Создать VM
+  ansible.builtin.command: >-
+    virt-install --name {{ item.name }}
+    --memory {{ item.memory }} --vcpus {{ item.vcpus }}
+    --disk vol=default/{{ item.name }}.qcow2,bus=virtio
+    {% if item.extra_disk %}--disk vol=default/{{ item.name }}-data.qcow2,bus=virtio {% endif %}
+    --disk vol=default/seed-{{ item.name }}.iso,device=cdrom
+    --os-variant ubuntu24.04
+    --network network=default,model=virtio,mac={{ item.mac }}
+    --graphics none --import --noautoconsole
+  loop: "{{ vms }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.vcpus }} vCPU / {{ item.memory }} MiB)"
+  when: item.name not in existing_domains.stdout_lines
+
+- name: Дождаться SSH
+  # Это только «порт открылся». Готовность cloud-init ждёт cluster.yml через raw —
+  # до его завершения python3 может ещё отсутствовать
+  ansible.builtin.wait_for:
+    host: "{{ item.ip }}"
+    port: 22
+    timeout: 300
+    delay: 5
+  loop: "{{ vms }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.ip }})"

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-media
+  namespace: media
+  labels:
+    app.kubernetes.io/part-of: media-stack
+spec:
+  accessModes:
+    - ReadWriteMany
+  # storageClassName отличный от local-path (который is-default-class: true) + явный
+  # volumeName — чтобы PVC гарантированно не попал под динамический local-path
+  # провижионер и однозначно привязался именно к nfs-media-pv.
+  storageClassName: nfs
+  volumeName: nfs-media-pv
+  resources:
+    requests:
+      storage: 20Gi

@@ -1,0 +1,19 @@
+# kubeadm join. Заменяет вторую половину 02-bootstrap-cluster.sh.
+---
+- name: Присоединён ли уже воркер
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+
+- name: kubeadm join
+  ansible.builtin.command: >-
+    {{ hostvars[groups['control_plane'][0]]['kubeadm_join'] }}
+    --node-name={{ inventory_hostname }}
+  when: not kubelet_conf.stat.exists
+
+- name: Дождаться, пока воркер станет Ready
+  ansible.builtin.command: >-
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  changed_when: false

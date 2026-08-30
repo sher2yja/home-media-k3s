@@ -1,0 +1,93 @@
+# Настройка гостей: кластер и NFS. Заменяет 02-bootstrap-cluster.sh.
+# VM должны существовать — см. provision.yml.
+---
+- name: Дождаться завершения cloud-init на всех гостях
+  hosts: cluster:storage
+  gather_facts: false
+  become: true
+  tasks:
+    # raw, а не command: python3 ставит сам cloud-init, до его завершения
+    # обычные модули Ansible работать не могут
+    - name: cloud-init status --wait
+      ansible.builtin.raw: cloud-init status --wait
+      changed_when: false
+      retries: 3
+      delay: 10
+      register: ci
+      until: ci.rc == 0
+
+    - name: Собрать факты (python3 уже есть)
+      ansible.builtin.setup:
+
+- name: NFS-хранилище
+  hosts: storage
+  become: true
+  roles:
+    - nfs_server
+
+- name: Подготовка нод Kubernetes
+  hosts: cluster
+  become: true
+  roles:
+    - kube_node
+
+- name: Control-plane
+  hosts: control_plane
+  become: true
+  roles:
+    - control_plane
+
+- name: Воркеры
+  hosts: workers
+  become: true
+  roles:
+    - worker
+
+- name: Готовность кластера целиком
+  hosts: control_plane
+  gather_facts: false
+  tasks:
+    # Ждём здесь, а не в роли control_plane: local-path-provisioner не переносит
+    # taint control-plane и не может стартовать, пока воркер не присоединился
+    - name: Дождаться local-path-provisioner
+      become: true
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n local-path-storage wait --for=condition=Available
+        deployment/local-path-provisioner --timeout=300s
+      changed_when: false
+
+    - name: Дождаться готовности CoreDNS
+      become: true
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n kube-system wait --for=condition=Available
+        deployment/coredns --timeout=300s
+      changed_when: false
+
+- name: Забрать kubeconfig на хост
+  hosts: control_plane
+  gather_facts: false
+  tasks:
+    - name: Прочитать admin.conf
+      become: true
+      ansible.builtin.slurp:
+        src: /etc/kubernetes/admin.conf
+      register: kubeconfig_raw
+
+    - name: Каталог ~/.kube на хосте
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.kube"
+        state: directory
+        mode: "0755"
+
+    - name: Записать kubeconfig с адресом control-plane
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        # kubeadm пишет туда внутренний адрес, снаружи нужен IP ноды
+        content: "{{ kubeconfig_raw.content | b64decode | regex_replace('server: https://[^\\s]+', 'server: https://' + ansible_host + ':6443') }}"
+        dest: "{{ lookup('env', 'HOME') }}/.kube/config"
+        mode: "0600"
