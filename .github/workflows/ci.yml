@@ -283,6 +283,12 @@ jobs:
     needs: [check, e2e, build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # Право на запись выдано ТОЛЬКО этой задаче, а не всему workflow. Новым
+    # репозиториям GITHUB_TOKEN выдаётся на чтение, и без этой строки создание
+    # релиза падает с 403 "Resource not accessible by integration" — при том что
+    # артефакты скачиваются нормально, и выглядит это как ошибка выкладки.
+    permissions:
+      contents: write
     steps:
       # Пересборки здесь нет специально: выкладывается ровно то, что прошло
       # проверки и e2e, а не собранное заново из тех же исходников.
