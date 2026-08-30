@@ -124,20 +124,44 @@ jobs:
           PY
 
       # Головы у раннера нет, поэтому окно собирается в виртуальном X-сервере.
-      # Проверка грубая, но ловит то, что ломается чаще всего: опечатку в имени
-      # виджета или обращение к атрибуту, которого ещё нет.
-      - name: Окно приложения собирается
+      # Одной проверки «окно построилось» мало: она пропускает целый класс
+      # ошибок — обращение к Tk из фонового потока. Поэтому цикл крутится, пока
+      # предпроверки реально не отрисуются, и результат читается из виджетов.
+      - name: Окно приложения собирается и предпроверки отрисовываются
         run: |
           sudo apt-get install -y -qq xvfb
           xvfb-run -a python - <<'PY'
-          import sys
+          import sys, time
           sys.path.insert(0, 'app')
           import ui
+
           app = ui.App()
-          app.update()
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              app.update()
+              if not app._busy and app.checks_frame.winfo_children():
+                  break
+              time.sleep(0.1)
+
           assert app.notebook.index('end') == 4, 'вкладок должно быть четыре'
+
+          def texts(w):
+              for ch in w.winfo_children():
+                  try:
+                      if ch.cget('text'):
+                          yield ch.cget('text')
+                  except Exception:
+                      pass
+                  yield from texts(ch)
+
+          rendered = list(texts(app.checks_frame))
+          assert rendered, 'предпроверки не отрисовались'
+          broken = [t for t in rendered if 'Не удалось проверить' in t]
+          assert not broken, broken
+          assert any('Проверяю' not in t for t in rendered), 'проверки не завершились'
+          print('окно собирается, вкладок 4, предпроверок отрисовано:',
+                sum(1 for t in rendered if t in ('✓', '✕')))
           app.destroy()
-          print('окно собирается, вкладок 4')
           PY
 
   # Первая в проекте проверка продукта целиком: настоящий k3s, настоящие образы,

@@ -181,8 +181,12 @@ class App(tk.Tk):
         for child in self.checks_frame.winfo_children():
             child.destroy()
         ttk.Label(self.checks_frame, text="Проверяю…").pack(anchor="w")
-        self.run_bg(lambda log: install.preflight(Path(self.media_dir.get())),
-                    self._show_checks)
+        # Значение переменной читаем ЗДЕСЬ, в потоке окна, и передаём в поток уже
+        # обычной строкой. Tk-переменная, прочитанная из чужого потока, роняет
+        # проверку с «main thread is not in main loop» — а выглядит это как
+        # «предпроверки не работают», без всякого намёка на причину.
+        media_dir = Path(self.media_dir.get())
+        self.run_bg(lambda log: install.preflight(media_dir), self._show_checks)
 
     def _show_checks(self, checks) -> None:
         for child in self.checks_frame.winfo_children():
