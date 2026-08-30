@@ -21,39 +21,29 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import config
+import icon
 import install
 import media
 
 PAD = 10
 
-# Имя класса окна. Без него Tk отдаёт менеджеру окон безликое WM_CLASS "tk"/"Tk",
-# и GNOME не может сопоставить окно с приложением: в панели задач записи просто
-# не появляется, хотя окно на экране есть. Проверено на Ubuntu 24.04 с GNOME.
-WM_CLASS_NAME = "home-media-k3s"
+# Имя класса окна берётся из install, а не пишется здесь второй раз: по нему GNOME
+# связывает открытое окно с пунктом меню (StartupWMClass). Разъедутся эти два
+# значения — окно потеряет и имя, и иконку, а понять почему будет неоткуда.
+WM_CLASS_NAME = install.DESKTOP_ID
 
 
 def _app_icon() -> tk.PhotoImage:
-    """Иконка рисуется прямо здесь, файлом не лежит.
+    """Иконка окна. Пиксели общие с PNG для пункта меню — см. icon.py.
 
-    Причина практическая. Без _NET_WM_ICON панели задач нечего показать рядом с
-    именем окна, а класть картинку в бандл — это лишний файл в сборке и лишний
-    путь, который потом надо искать через sys._MEIPASS. Tk рисует сам, и одной
-    заботой в spec-файле меньше.
+    Заголовок окна её показывает, но панели задач в GNOME 46 этого мало: там
+    иконка берётся из .desktop, а не из свойства окна. Поэтому одной этой
+    функции недостаточно, нужна ещё install.ensure_desktop_entry().
     """
-    size, bg, fg = 64, "#1f6feb", "#ffffff"
-    rows = []
-    for y in range(size):
-        row = []
-        for x in range(size):
-            # Треугольник «плей»: основание слева, вершина справа по центру.
-            along = (x - 20) / 26
-            half = (1 - along) * 16
-            inside = 0.0 <= along <= 1.0 and abs(y - size / 2) <= half
-            row.append(fg if inside else bg)
-        rows.append(tuple(row))
-    icon = tk.PhotoImage(width=size, height=size)
-    icon.put(tuple(rows))
-    return icon
+    rows = icon.pixels()
+    image = tk.PhotoImage(width=len(rows[0]), height=len(rows))
+    image.put(tuple(tuple(f"#{r:02x}{g:02x}{b:02x}" for r, g, b in row) for row in rows))
+    return image
 
 
 class App(tk.Tk):

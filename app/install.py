@@ -20,6 +20,7 @@ import json
 import os
 import platform
 import secrets
+import shlex
 import shutil
 import socket
 import string
@@ -32,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 import config
+import icon
 
 # --- Где лежат манифесты ----------------------------------------------------
 
@@ -372,6 +374,78 @@ def apply_volumes(config_dir: Path, media_dir: Path, on_line=None) -> None:
         raise RuntimeError("Не удалось создать тома: " + r.stdout[-2000:])
 
 
+# --- Пункт меню приложений (Linux) ------------------------------------------
+
+DESKTOP_ID = "home-media-k3s"
+
+# Имя класса окна должно совпадать с ui.WM_CLASS_NAME: по нему GNOME связывает
+# открытое окно с этим файлом. Не совпадёт — окно останется безымянным с серой
+# заглушкой вместо иконки.
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=Домашний медиасервер
+Comment=Установка и управление домашним медиасервером
+Exec={command}
+Icon={icon}
+Terminal=false
+Categories=AudioVideo;Network;
+StartupWMClass={wmclass}
+"""
+
+
+def _launch_command() -> str:
+    """Команда запуска для пункта меню.
+
+    В собранном бандле sys.executable — это сам бандл, и его достаточно. При
+    запуске из исходников это интерпретатор, поэтому дописывается путь к main.py.
+    """
+    if getattr(sys, "frozen", False):
+        return shlex.quote(sys.executable)
+    main = Path(__file__).resolve().parent / "main.py"
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(main))}"
+
+
+def ensure_desktop_entry() -> Path | None:
+    """Прописывает приложение в меню и в панель задач. Возвращает путь к файлу.
+
+    Зачем это вообще нужно, хотя иконка у окна уже есть: GNOME Shell 46 больше НЕ
+    берёт картинку из свойства окна _NET_WM_ICON. Окну, которому не нашлось
+    .desktop, он рисует стандартную заглушку application-x-executable — серую
+    шестерёнку без имени. Проверено живьём на Ubuntu 24.04. Единственный способ
+    показать своё — положить PNG на диск и сослаться на него отсюда.
+
+    Побочная и не менее важная польза: приложение появляется в меню, и человеку
+    больше не нужно каждый раз искать скачанный файл в «Загрузках».
+
+    Ошибки глотаются намеренно: пункт меню — удобство, и если домашний каталог
+    оказался недоступен на запись, установка медиасервера из-за этого падать
+    не должна.
+    """
+    if config.is_windows():
+        return None
+    try:
+        icons = Path.home() / ".local/share/icons/hicolor/64x64/apps"
+        icons.mkdir(parents=True, exist_ok=True)
+        (icons / f"{DESKTOP_ID}.png").write_bytes(icon.png_bytes())
+
+        apps = Path.home() / ".local/share/applications"
+        apps.mkdir(parents=True, exist_ok=True)
+        entry = apps / f"{DESKTOP_ID}.desktop"
+        entry.write_text(DESKTOP_ENTRY.format(
+            command=_launch_command(), icon=DESKTOP_ID, wmclass=DESKTOP_ID),
+            encoding="utf-8")
+        entry.chmod(0o644)
+
+        # Кэш меню обновляем, если есть чем: без этого пункт появляется не сразу.
+        # Отсутствие утилиты — не ошибка, GNOME подхватит файл и сам.
+        if shutil.which("update-desktop-database"):
+            subprocess.run(["update-desktop-database", str(apps)],
+                           capture_output=True, check=False, timeout=30)
+        return entry
+    except OSError:
+        return None
+
+
 # --- Пароль qBittorrent в кластере ------------------------------------------
 
 QBT_SECRET = "qbittorrent-webui"
@@ -434,6 +508,11 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
     # Windows и по нему же чинится неудачная установка кнопкой «перепроверить».
     config.save_state(profile=profile_key, config_dir=str(config_dir),
                       media_dir=str(media_dir))
+
+    # Пункт меню создаём в начале: установка идёт минуты, и всё это время окно
+    # должно быть опознаваемым в панели задач, а не серой шестерёнкой.
+    if ensure_desktop_entry() and on_line:
+        on_line("Добавил приложение в меню")
 
     ensure_cluster(on_line)
     wait_for_node(on_line=on_line)
@@ -637,6 +716,12 @@ def _self_check() -> None:
     assert '"/tmp/media"' in rendered
     assert '"/tmp/cfg/jellyfin"' in rendered
     assert rendered.count("kind: PersistentVolume") == 7
+
+    # Пункт меню собирается без обращения к диску: подстановка не должна оставлять
+    # незаполненных мест, а имя класса — расходиться с тем, что ставит окно.
+    entry = DESKTOP_ENTRY.format(command="/bin/true", icon=DESKTOP_ID, wmclass=DESKTOP_ID)
+    assert "{" not in entry, "в шаблоне пункта меню остались плейсхолдеры"
+    assert f"StartupWMClass={DESKTOP_ID}" in entry
 
     hashed = qbittorrent_pbkdf2("проверка")
     assert hashed.startswith("@ByteArray(") and hashed.endswith(")")

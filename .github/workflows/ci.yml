@@ -43,6 +43,9 @@ jobs:
       - name: Самопроверка путей и шаблона томов
         run: cd app && python install.py
 
+      - name: Самопроверка иконки
+        run: cd app && python icon.py
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'
