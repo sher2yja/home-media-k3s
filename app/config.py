@@ -14,8 +14,6 @@
 from __future__ import annotations
 
 import json
-import os
-import platform
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,15 +168,8 @@ def internal_url(key: str) -> str:
 APP_DIRNAME = "home-media-k3s"
 
 
-def is_windows() -> bool:
-    return platform.system() == "Windows"
-
-
 def default_config_dir() -> Path:
     """Куда класть настройки сервисов (их базы, ключи, история)."""
-    if is_windows():
-        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
-        return Path(base) / APP_DIRNAME / "config"
     return Path.home() / ".local" / "share" / APP_DIRNAME / "config"
 
 

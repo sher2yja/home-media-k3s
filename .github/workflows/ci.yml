@@ -338,15 +338,7 @@ jobs:
 
   build:
     needs: check
-    strategy:
-      fail-fast: false        # сборка под одну ОС не должна прятать результат другой
-      matrix:
-        include:
-          - os: ubuntu-latest
-            asset: home-media-k3s-linux
-          - os: windows-latest
-            asset: home-media-k3s-windows.exe
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -359,28 +351,15 @@ jobs:
           pip install pyinstaller==6.22.2
           pyinstaller --clean --noconfirm home-media-k3s.spec
 
-      # Один файл на каждую ОС: человек скачивает и запускает. Манифесты уже внутри
-      # бандла, отдельно их качать не нужно.
-      - name: Переименовать под ОС
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            mv dist/home-media-k3s.exe "dist/${{ matrix.asset }}"
-          else
-            mv dist/home-media-k3s "dist/${{ matrix.asset }}"
-          fi
-
-      # Единственная проверка Windows-ветки, которую вообще можно автоматизировать:
-      # что собранное окно открывается. Цепочка WSL2 на раннере не проверяется.
-      - name: Окно собирается (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          python -c "import sys; sys.path.insert(0,'app'); import ui; a=ui.App(); a.update(); a.destroy(); print('ok')"
+      # Один файл: человек скачивает и запускает. Манифесты уже внутри бандла,
+      # отдельно их качать не нужно.
+      - name: Переименовать
+        run: mv dist/home-media-k3s dist/home-media-k3s-linux
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: home-media-k3s-linux
+          path: dist/home-media-k3s-linux
           if-no-files-found: error
 
   release:
@@ -408,8 +387,9 @@ jobs:
           # он в каждом релизе разъедется с тем, что на самом деле поменялось.
           generate_release_notes: true
           body: |
-            Скачайте файл под свою систему и запустите — откроется окно установки.
+            Скачайте файл и запустите — откроется окно установки. Нужен Linux
+            с systemd, всё остальное программа поставит сама.
 
-            Linux: нужен systemd, всё остальное программа поставит сама.
-            Windows: программа сама включит WSL2 и поставит в него Linux;
-            понадобится подтверждение администратора и одна перезагрузка.
+            Версии для Windows пока нет: путь через WSL2 был написан по
+            документации и ни разу не проверялся на живой машине, поэтому снят.
+            Он вернётся отдельным релизом.

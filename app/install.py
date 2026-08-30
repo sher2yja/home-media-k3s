@@ -1,10 +1,9 @@
 """Установка стека на машину пользователя: кластер k3s, тома, пароль qBittorrent.
 
-Одна и та же последовательность на обеих ОС — меняется только то, ЧЕМ запускается
-команда. На Linux k3s ставится в систему прямо, на Windows под него подкладывается
-WSL2, и `kubectl` вызывается внутри дистрибутива. Вся разница между платформами
-собрана в двух функциях, `kubectl_command()` и `host_path()`; выше по коду
-ветвления по ОС нет.
+Приложение ставит медиасервер только на Linux: k3s ложится в систему службой, а
+`kubectl` берётся из самого k3s. Ветвлений по ОС здесь нет ни одного — путь через
+WSL2 снят 2026-08-30, потому что проверить его было нечем (машины с Windows нет).
+Он вернётся отдельной работой; снятый код целиком лежит в теге v0.1.3.
 
 Здесь же лежит ЕДИНСТВЕННАЯ в проекте реализация PBKDF2-хеша для qBittorrent.
 Её же вызывает infra/vms/scripts/08-qbittorrent-secret.sh, который делает то же
@@ -18,7 +17,6 @@ import base64
 import hashlib
 import json
 import os
-import platform
 import secrets
 import shlex
 import shutil
@@ -31,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 import config
 import icon
@@ -85,18 +83,6 @@ def qbittorrent_pbkdf2(password: str) -> str:
 
 # --- Слой запуска команд ----------------------------------------------------
 
-WSL_DISTRO = "Ubuntu"
-
-# Флаг Windows: без него каждая вызванная команда мигает чёрным окном консоли.
-# На Linux атрибута нет, поэтому берём через getattr.
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-
-class RebootRequired(Exception):
-    """Windows включил компоненты WSL и требует перезагрузки. Не ошибка: установка
-    продолжится после перезапуска приложения, состояние уже сохранено."""
-
-
 class ManualStepRequired(Exception):
     """Шаг требует прав, которых приложение не получило. Несёт готовую команду —
     человеку остаётся скопировать её, а не сочинять самому."""
@@ -106,15 +92,6 @@ class ManualStepRequired(Exception):
         self.command = command
 
 
-def _decode(raw: bytes) -> str:
-    """wsl.exe пишет вывод в UTF-16LE, а не в UTF-8, и обычное декодирование даёт
-    строку с нулевым байтом между каждой буквой. Проверка на «Ubuntu in wsl -l»
-    из-за этого молча не срабатывает."""
-    if raw[:1] == b"\x00" or (len(raw) > 1 and raw[1:2] == b"\x00"):
-        return raw.decode("utf-16-le", errors="replace")
-    return raw.decode("utf-8", errors="replace")
-
-
 def run(cmd: list[str], *, timeout: int = 1800,
         on_line=None) -> subprocess.CompletedProcess:
     """Запускает команду, отдавая вывод построчно в on_line.
@@ -122,15 +99,18 @@ def run(cmd: list[str], *, timeout: int = 1800,
     Построчно, а не одним куском в конце: установка идёт минуты, и окно, в котором
     ничего не происходит, человек закрывает. Ошибки не глотаем и returncode
     разбираем сами — при разборе проблемы нужен сырой текст, а не наш пересказ.
+
+    errors="replace", а не строгое декодирование: наружу печатает чужой установщик
+    k3s, и одна битая последовательность в его выводе не должна ронять установку.
     """
     if on_line:
         on_line("$ " + " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            creationflags=_NO_WINDOW)
+                            text=True, errors="replace")
     lines: list[str] = []
     deadline = time.monotonic() + timeout
     for raw in proc.stdout:
-        line = _decode(raw).rstrip("\r\n")
+        line = raw.rstrip("\r\n")
         lines.append(line)
         if on_line:
             on_line(line)
@@ -145,32 +125,11 @@ def run(cmd: list[str], *, timeout: int = 1800,
 def kubectl_command(*args: str) -> list[str]:
     """kubectl отдельно не ставится: k3s несёт его в себе, а kustomize встроен
     в сам kubectl. Одной зависимостью меньше и на диске, и в бандле."""
-    if config.is_windows():
-        return ["wsl", "-d", WSL_DISTRO, "-u", "root", "--", "k3s", "kubectl", *args]
     return ["k3s", "kubectl", *args]
 
 
 def kubectl(*args: str, on_line=None, timeout: int = 900) -> subprocess.CompletedProcess:
     return run(kubectl_command(*args), on_line=on_line, timeout=timeout)
-
-
-def windows_to_wsl(path) -> str:
-    r"""D:\Movies\Кино -> /mnt/d/Movies/Кино.
-
-    Отдельной функцией, а не внутри host_path, чтобы её можно было проверить на
-    Linux: PureWindowsPath разбирает windows-пути на любой ОС.
-    """
-    w = PureWindowsPath(path)
-    drive = w.drive.rstrip(":").lower()
-    rest = "/".join(w.parts[1:])
-    return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
-
-
-def host_path(path: Path) -> str:
-    """Путь, каким его увидит кластер. На Windows кластер живёт внутри WSL2, и
-    диски Windows видны ему как /mnt/<буква>. Это касается и папок пользователя,
-    и самих манифестов: бандл распаковывается во временный каталог Windows."""
-    return windows_to_wsl(path) if config.is_windows() else str(path)
 
 
 # --- Подъём кластера --------------------------------------------------------
@@ -187,10 +146,6 @@ K3S_EXEC = "--write-kubeconfig-mode 0644"
 
 
 def k3s_installed() -> bool:
-    if config.is_windows():
-        r = run(["wsl", "-d", WSL_DISTRO, "-u", "root", "--",
-                 "sh", "-c", "command -v k3s"], timeout=60)
-        return r.returncode == 0
     return shutil.which("k3s") is not None
 
 
@@ -242,110 +197,10 @@ def install_k3s_linux(on_line=None) -> None:
         raise RuntimeError(f"Установщик k3s завершился с кодом {r.returncode}")
 
 
-# --- Windows: цепочка WSL2 --------------------------------------------------
-
-def _wsl_available() -> bool:
-    if not shutil.which("wsl"):
-        return False
-    return run(["wsl", "--status"], timeout=60).returncode == 0
-
-
-def _distro_installed() -> bool:
-    r = run(["wsl", "-l", "-q"], timeout=60)
-    return WSL_DISTRO.lower() in r.stdout.lower()
-
-
-def _systemd_enabled() -> bool:
-    """Без systemd k3s не поставить службой, а без службы он не переживёт
-    перезапуск компьютера — то есть медиасервер не поднимется сам."""
-    r = run(["wsl", "-d", WSL_DISTRO, "-u", "root", "--",
-             "sh", "-c", "test -d /run/systemd/system"], timeout=120)
-    return r.returncode == 0
-
-
-def _run_elevated(powershell_command: str) -> None:
-    """Перезапускает одну команду с повышением прав через штатное окно UAC.
-
-    ShellExecuteW возвращает управление сразу и кода завершения не отдаёт —
-    поэтому вызывающий обязан после неё перепроверить состояние, а не считать,
-    что всё получилось.
-    """
-    import ctypes
-    rc = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", "powershell.exe",
-        f"-NoProfile -ExecutionPolicy Bypass -Command {powershell_command}", None, 1)
-    if int(rc) <= 32:   # документированный признак отказа, в т.ч. «человек нажал Нет»
-        raise ManualStepRequired(
-            "Нужны права администратора. Запустите PowerShell от имени "
-            "администратора и выполните команду.", powershell_command)
-
-
-def ensure_wsl(on_line=None) -> None:
-    """Проводит Windows по цепочке до состояния «внутри есть Ubuntu с systemd».
-
-    Каждый шаг проверяется отдельно и делается только если нужен: человек может
-    прийти сюда с уже включённым WSL, с включённым но без дистрибутива, или после
-    перезагрузки посреди установки.
-    """
-    if not _wsl_available():
-        if on_line:
-            on_line("Включаю компоненты WSL2 — понадобится подтверждение администратора")
-        _run_elevated("wsl --install --no-launch")
-        # Компоненты Windows включаются только после перезагрузки. Флаг переживёт
-        # закрытие приложения, поэтому после перезапуска мы окажемся не здесь,
-        # а сразу на следующем шаге.
-        config.save_state(wsl_reboot_pending=True)
-        raise RebootRequired(
-            "Windows включил компоненты WSL2. Перезагрузите компьютер и запустите "
-            "программу снова — установка продолжится с этого места.")
-
-    if config.load_state().get("wsl_reboot_pending"):
-        config.save_state(wsl_reboot_pending=False)
-
-    if not _distro_installed():
-        if on_line:
-            on_line(f"Ставлю {WSL_DISTRO} внутрь WSL2, это несколько минут")
-        # --no-launch: без него установщик открывает консоль и ждёт, пока человек
-        # придумает логин и пароль linux-пользователя. Пользователь внутри не нужен —
-        # всё делается от root, а сервисы и так работают под PUID=1000.
-        r = run(["wsl", "--install", "-d", WSL_DISTRO, "--no-launch"], on_line=on_line)
-        if r.returncode != 0 or not _distro_installed():
-            raise ManualStepRequired(
-                f"Не удалось поставить {WSL_DISTRO} внутрь WSL2.",
-                f"wsl --install -d {WSL_DISTRO} --no-launch")
-
-    if not _systemd_enabled():
-        if on_line:
-            on_line("Включаю systemd внутри WSL2")
-        run(["wsl", "-d", WSL_DISTRO, "-u", "root", "--", "sh", "-c",
-             "printf '[boot]\\nsystemd=true\\n' > /etc/wsl.conf"], on_line=on_line)
-        # Перечитать /etc/wsl.conf дистрибутив может только при полном останове WSL:
-        # обычный выход из оболочки его не перезапускает.
-        run(["wsl", "--shutdown"], on_line=on_line, timeout=120)
-        if not _systemd_enabled():
-            raise ManualStepRequired(
-                "systemd внутри WSL2 не включился. Обычно это старая версия WSL.",
-                "wsl --update")
-
-
-def install_k3s_windows(on_line=None) -> None:
-    ensure_wsl(on_line)
-    if k3s_installed():
-        return
-    if on_line:
-        on_line("Ставлю k3s внутрь WSL2")
-    r = run(["wsl", "-d", WSL_DISTRO, "-u", "root", "--", "sh", "-c",
-             f'curl -sfL {K3S_INSTALL_URL} | INSTALL_K3S_EXEC="{K3S_EXEC}" sh -'],
-            on_line=on_line)
-    if r.returncode != 0:
-        raise RuntimeError(f"Установщик k3s внутри WSL2 завершился с кодом {r.returncode}")
-
-
 def ensure_cluster(on_line=None) -> None:
-    """Единственное место с ветвлением по ОС в самом сценарии установки."""
-    if config.is_windows():
-        install_k3s_windows(on_line)
-    elif not k3s_installed():
+    """Шов, через который однажды вернётся вторая ОС: сценарий установки выше по
+    коду не знает, чем именно поднят кластер, и от способа не зависит."""
+    if not k3s_installed():
         install_k3s_linux(on_line)
 
 
@@ -383,9 +238,9 @@ def render_volumes(config_dir: Path, media_dir: Path) -> str:
     не ломают манифест. PyYAML ради этого в зависимости не тянем.
     """
     tmpl = (overlay_dir() / "hostpath-volumes.yaml.tmpl").read_text(encoding="utf-8")
-    values = {"media": json.dumps(host_path(media_dir))}
+    values = {"media": json.dumps(str(media_dir))}
     for service in config.SERVICES:
-        values[service.key] = json.dumps(host_path(config_dir / service.key))
+        values[service.key] = json.dumps(str(config_dir / service.key))
     return tmpl.format(**values)
 
 
@@ -393,7 +248,7 @@ def apply_volumes(config_dir: Path, media_dir: Path, on_line=None) -> None:
     rendered = render_volumes(config_dir, media_dir)
     path = Path(tempfile.gettempdir()) / "home-media-k3s-volumes.yaml"
     path.write_text(rendered, encoding="utf-8")
-    r = kubectl("apply", "-f", host_path(path), on_line=on_line)
+    r = kubectl("apply", "-f", str(path), on_line=on_line)
     if r.returncode != 0:
         raise RuntimeError("Не удалось создать тома: " + r.stdout[-2000:])
 
@@ -445,8 +300,6 @@ def ensure_desktop_entry() -> Path | None:
     оказался недоступен на запись, установка медиасервера из-за этого падать
     не должна.
     """
-    if config.is_windows():
-        return None
     try:
         icons = Path.home() / ".local/share/icons/hicolor/64x64/apps"
         icons.mkdir(parents=True, exist_ok=True)
@@ -758,7 +611,7 @@ def wait_for_volumes(timeout: int = 180, on_line=None) -> None:
 
 
 def apply_stack(on_line=None) -> subprocess.CompletedProcess:
-    return kubectl("apply", "-k", host_path(overlay_dir()), on_line=on_line)
+    return kubectl("apply", "-k", str(overlay_dir()), on_line=on_line)
 
 
 # Развёртывания на образах linuxserver.io: они и только они читают PUID/PGID.
@@ -776,12 +629,7 @@ def container_identity() -> tuple[str, str]:
     не смогут. Сообщения об этом человек не увидит: подъедут они нормально, а
     отказ придёт позже и в чужом интерфейсе — Sonarr отвечает 400 на добавление
     корневой папки, не называя причиной права.
-
-    На Windows остаётся 1000: диски видны изнутри WSL2 как DrvFs, права там
-    синтетические (всё 0777), и настоящий uid значения не имеет.
     """
-    if config.is_windows():
-        return "1000", "1000"
     return str(os.getuid()), str(os.getgid())
 
 
@@ -818,14 +666,14 @@ def wait_for_pods(timeout: int = 900, on_line=None) -> subprocess.CompletedProce
 def apply_monitoring(on_line=None) -> subprocess.CompletedProcess:
     # Каталогом, а не по файлам: числовой префикс задаёт порядок, а apply -f по
     # каталогу применяет их в алфавитном порядке — namespace 00 идёт первым.
-    return kubectl("apply", "-f", host_path(monitoring_dir()), on_line=on_line)
+    return kubectl("apply", "-f", str(monitoring_dir()), on_line=on_line)
 
 
 def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -> dict:
     """Полная установка. Возвращает то, что нужно показать человеку."""
     prepare_dirs(config_dir, media_dir)
-    # Состояние пишем ДО запуска: по нему продолжается установка после перезагрузки
-    # Windows и по нему же чинится неудачная установка кнопкой «перепроверить».
+    # Состояние пишем ДО запуска: по нему чинится неудачная установка кнопкой
+    # «перепроверить и починить», когда что-то не поднялось с первого раза.
     config.save_state(profile=profile_key, config_dir=str(config_dir),
                       media_dir=str(media_dir))
 
@@ -838,8 +686,8 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
     wait_for_node(on_line=on_line)
 
     # Namespace нужен раньше Secret'а и томов — они оба в него кладутся.
-    kubectl("apply", "-f", host_path(bundle_root() / "k8s" / "media-stack"
-                                     / "00-namespace.yaml"), on_line=on_line)
+    kubectl("apply", "-f", str(bundle_root() / "k8s" / "media-stack"
+                               / "00-namespace.yaml"), on_line=on_line)
     password = create_qbittorrent_secret(on_line)
     apply_volumes(config_dir, media_dir, on_line)
     result = apply_stack(on_line)
@@ -894,17 +742,11 @@ def repair(on_line=None) -> dict:
 
 # --- Предпроверки -----------------------------------------------------------
 
-WSL_DOCS = "https://learn.microsoft.com/ru-ru/windows/wsl/install"
 K3S_DOCS = "https://docs.k3s.io/ru/quick-start"
 
 # Порог с запасом: сами образы занимают около 3 ГБ, остальное — место под фильмы,
 # без которого стек запустится и тут же встанет.
 MIN_FREE_GB = 15
-
-# wsl --install появился в Windows 10 build 19041 (версия 2004). На более старых
-# сборках вся цепочка ниже неприменима, и честнее сказать это сразу.
-MIN_WINDOWS_BUILD = 19041
-
 
 @dataclass
 class Check:
@@ -949,53 +791,6 @@ def _ports_check() -> Check:
     )
 
 
-def _windows_checks() -> list[Check]:
-    """Цепочка WSL2 показывается по шагам специально: человек видит, где именно
-    он находится, а не одно «не готово» на всю установку. Ни один шаг не
-    блокирующий — приложение умеет пройти их само, кнопкой «Установить»."""
-    build = int(platform.version().rsplit(".", 1)[-1] or 0)
-    checks = [Check(
-        build >= MIN_WINDOWS_BUILD,
-        "Версия Windows",
-        f"сборка {build}",
-        fix="Нужна Windows 10 версии 2004 или новее (или Windows 11). "
-            "Обновите систему через Центр обновления.",
-        link=WSL_DOCS,
-    )]
-    if not checks[0].ok:
-        return checks
-
-    if config.load_state().get("wsl_reboot_pending"):
-        checks.append(Check(
-            False, "Перезагрузка",
-            "компоненты WSL2 включены, но ещё не работают",
-            fix="Перезагрузите компьютер и запустите программу снова — "
-                "установка продолжится с этого места.",
-        ))
-        return checks
-
-    wsl = _wsl_available()
-    checks.append(Check(wsl, "WSL2", "работает" if wsl else "не установлен",
-                        fix="Программа включит его сама при установке. "
-                            "Понадобится подтверждение администратора и перезагрузка.",
-                        link=WSL_DOCS, blocking=False))
-    if not wsl:
-        return checks
-
-    distro = _distro_installed()
-    checks.append(Check(distro, f"Linux внутри WSL2 ({WSL_DISTRO})",
-                        "установлен" if distro else "не установлен",
-                        fix="Программа поставит его сама при установке.",
-                        blocking=False))
-    if distro:
-        systemd = _systemd_enabled()
-        checks.append(Check(systemd, "systemd внутри WSL2",
-                            "включён" if systemd else "выключен",
-                            fix="Программа включит его сама при установке.",
-                            blocking=False))
-    return checks
-
-
 def _linux_checks() -> list[Check]:
     systemd = Path("/run/systemd/system").is_dir()
     checks = [Check(
@@ -1023,7 +818,7 @@ def preflight(media_dir: Path | None = None) -> list[Check]:
     """Всё, что должно быть в порядке ДО установки. Возвращает список, а не первое
     падение: человеку полезнее увидеть сразу все проблемы, чем чинить их по одной
     и каждый раз запускать проверку заново."""
-    checks = _windows_checks() if config.is_windows() else _linux_checks()
+    checks = _linux_checks()
     checks.append(_disk_check(media_dir))
     checks.append(_ports_check())
     return checks
@@ -1035,13 +830,6 @@ def blocking_failures(checks: list[Check]) -> list[Check]:
 
 def _self_check() -> None:
     """Минимальная проверка того, где логика, а не вызовы внешних команд."""
-    assert windows_to_wsl(r"D:\Movies") == "/mnt/d/Movies"
-    assert windows_to_wsl(r"C:\Users\Ann\Видео\кино") == "/mnt/c/Users/Ann/Видео/кино"
-    assert windows_to_wsl("E:\\") == "/mnt/e"
-    # Путь бандла PyInstaller выглядит именно так, и он тоже обязан переводиться.
-    assert windows_to_wsl(r"C:\Users\Ann\AppData\Local\Temp\_MEI123\deploy\k3s") \
-        == "/mnt/c/Users/Ann/AppData/Local/Temp/_MEI123/deploy/k3s"
-
     # Шаблон томов обязан заполняться целиком: незакрытая скобка или лишний
     # плейсхолдер здесь дешевле поймать, чем на машине пользователя.
     rendered = render_volumes(Path("/tmp/cfg"), Path("/tmp/media"))

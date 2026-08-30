@@ -23,8 +23,6 @@ sudo apt install python3-tk        # Debian/Ubuntu: tkinter отдельным �
 python3 app/main.py
 ```
 
-На Windows Tk входит в установщик Python с python.org, ставить отдельно нечего.
-
 ## Проверки
 
 Тестового фреймворка в проекте нет намеренно. Проверяемая логика собрана в
@@ -32,7 +30,7 @@ python3 app/main.py
 
 ```bash
 cd app && python3 media.py      # разбор очередей *arr и статусов Jellyseerr
-cd app && python3 install.py    # перевод путей Windows→WSL, заполнение шаблона томов
+cd app && python3 install.py    # шаблон томов, пункт меню, перенос со ссылками
 cd app && python3 wire.py       # подстановка полей в схему настроек, разбор причины отказа
 cd app && python3 icon.py       # кодирование PNG без сторонних библиотек
 ```
@@ -53,17 +51,15 @@ for f in infra/vms/scripts/*.sh; do bash -n "$f"; done && shellcheck infra/vms/s
 
 ## Что приложение делает под капотом
 
-Установка — одна последовательность на обеих ОС. Всё, что различается, собрано
-в `install.kubectl_command()` и `install.host_path()`; выше по коду ветвлений
-по ОС нет.
+Установка ставит стек только на Linux, и ветвлений по ОС в `app/` нет ни одного.
+Путь через WSL2 для Windows снят 2026-08-30: проверить его было нечем. Единственный
+шов, куда он вернётся, — `install.ensure_cluster()`.
 
 ```
-ensure_desktop_entry  Linux: пункт меню + иконка PNG (см. ниже, почему обязательно)
+ensure_desktop_entry  пункт меню + иконка PNG (см. ниже, почему обязательно)
 prepare_dirs          создать папки от имени пользователя (не от root: контейнеры
                       linuxserver.io работают под PUID=1000 и иначе не запишут)
-ensure_cluster        Linux:   pkexec env INSTALL_K3S_EXEC=... sh k3s-install.sh
-                      Windows: wsl --install → перезагрузка → wsl --install -d Ubuntu
-                               → systemd в /etc/wsl.conf → тот же установщик внутри
+ensure_cluster        pkexec env INSTALL_K3S_EXEC=... sh k3s-install.sh
 wait_for_node         kubectl wait --for=condition=Ready node --all
 create_secret         пароль качалки: генерация + PBKDF2, kubectl create secret
 apply_volumes         hostpath-volumes.yaml.tmpl с подставленными путями
@@ -76,12 +72,6 @@ wire.configure        качалка, корневые папки, hardlink'и, 
 
 Отдельный бинарь `kubectl` не ставится: k3s несёт его в себе (`k3s kubectl`), а
 kustomize встроен в сам kubectl.
-
-На Windows кластер живёт внутри WSL2, поэтому пути переводятся: `D:\Movies` →
-`/mnt/d/Movies`. Это касается и папок пользователя, и самих манифестов — бандл
-PyInstaller распаковывается во временный каталог Windows, и оттуда же его читает
-`kubectl` изнутри WSL. Порты работают без проброса: WSL2 сам транслирует
-localhost.
 
 ## Ключевые решения
 
@@ -162,20 +152,15 @@ pyinstaller --clean --noconfirm home-media-k3s.spec
 |---|---|---|
 | `check` | всегда | линтер, самопроверки, YAML, bash+shellcheck, сборка оверлея, сверка портов, сборка окна под xvfb |
 | `e2e` | `master` и теги | ставит настоящий k3s, гоняет `install.install()` — тот же код, что у пользователя, — и опрашивает сервисы через `media.service_status()` |
-| `build` | всегда | PyInstaller под Linux и Windows, артефакты |
+| `build` | всегда | PyInstaller, артефакт `home-media-k3s-linux` |
 | `release` | теги `v*` | выкладывает артефакты `build` в GitHub Release без пересборки |
 
 ## Что не проверено
 
-**Цепочка WSL2 не проверялась на живой машине.** Windows у автора нет. Конвейер
-проверяет только сборку бандла и то, что окно открывается; `wsl --install`,
-повышение прав через UAC и перезагрузка посреди установки написаны по
-документации и живьём не запускались ни разу.
-
-**Hardlink на дисках Windows.** Внутри WSL2 папки пользователя видны как
-`/mnt/<буква>`. Поддерживает ли эта файловая система жёсткие ссылки так, как их
-ждут Sonarr и Radarr, не проверено. Если нет — каждый фильм займёт место дважды,
-и никакой ошибки при этом не будет.
+**Windows.** Версия под него не выпускается. Путь через WSL2 был написан по
+документации и не запускался ни разу — ни `wsl --install`, ни повышение прав
+через UAC, ни продолжение установки после перезагрузки. Проверить его было нечем,
+поэтому 2026-08-30 он снят из кода целиком; снятое лежит в теге `v0.1.3`.
 
 **Чистая машина.** `e2e` в CI — самое близкое к ней, но это раннер GitHub, а не
-компьютер человека с его антивирусом, правами и уже занятыми портами.
+компьютер человека с его правами, окружением и уже занятыми портами.

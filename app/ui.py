@@ -374,9 +374,6 @@ class App(tk.Tk):
             messagebox.showerror("Не получилось", result["reason"])
 
     def _install_done(self, result) -> None:
-        if isinstance(result, install.RebootRequired):
-            messagebox.showinfo("Нужна перезагрузка", str(result))
-            return
         if isinstance(result, install.ManualStepRequired):
             self._manual_step(result)
             return
