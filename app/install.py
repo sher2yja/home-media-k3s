@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -780,6 +781,57 @@ def _disk_check(media_dir: Path | None) -> Check:
     )
 
 
+# CoreDNS в кластере пересылает всё, что не про кластер, на серверы из resolv.conf
+# ноды — то есть на те же, что читает хост. Список виден и до установки кластера,
+# поэтому проверка работает на вкладке «Установка» в любой момент.
+RESOLV_CONF = (Path("/run/systemd/resolve/resolv.conf"), Path("/etc/resolv.conf"))
+
+
+def _upstream_resolvers() -> list[str]:
+    for path in RESOLV_CONF:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        found = [parts[1] for parts in (line.split() for line in lines)
+                 if len(parts) > 1 and parts[0] == "nameserver"]
+        if found:
+            return found
+    return []
+
+
+def _is_local(server: str) -> bool:
+    try:
+        return ipaddress.ip_address(server).is_private
+    except ValueError:
+        return False
+
+
+def _dns_check() -> Check:
+    """Показывает, у кого кластер спрашивает адреса сайтов.
+
+    Проверка не диагностическая, а объясняющая, и это осознанно. Поймать
+    избирательную фильтрацию заранее нельзя: домашний роутер отдаёт SERVFAIL
+    ровно на те домены, которые фильтрует провайдер, а на все остальные отвечает
+    нормально — общий контрольный запрос такое не увидит. Зато человеку, у
+    которого Prowlarr пишет «Name does not resolve», строчка с адресом его
+    роутера экономит вечер: причина названа до того, как он начнёт искать её в
+    настройках Prowlarr, где её нет. Разбор — в MANUAL.md.
+    """
+    servers = _upstream_resolvers()
+    if not servers:
+        return Check(True, "Поиск адресов сайтов (DNS)",
+                     "список серверов прочитать не удалось", blocking=False)
+    shown = ", ".join(servers[:3])
+    if any(_is_local(server) for server in servers):
+        return Check(True, "Поиск адресов сайтов (DNS)",
+                     f"спрашивает {shown}. Первый — сервер вашей сети; если "
+                     f"какой-то сайт «не резолвится», дело обычно в нём",
+                     blocking=False)
+    return Check(True, "Поиск адресов сайтов (DNS)", f"спрашивает {shown}",
+                 blocking=False)
+
+
 def _ports_check() -> Check:
     """Занятый порт — не обязательно помеха.
 
@@ -838,6 +890,7 @@ def preflight(media_dir: Path | None = None) -> list[Check]:
     checks = _linux_checks()
     checks.append(_disk_check(media_dir))
     checks.append(_ports_check())
+    checks.append(_dns_check())
     return checks
 
 
