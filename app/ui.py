@@ -26,11 +26,44 @@ import media
 
 PAD = 10
 
+# Имя класса окна. Без него Tk отдаёт менеджеру окон безликое WM_CLASS "tk"/"Tk",
+# и GNOME не может сопоставить окно с приложением: в панели задач записи просто
+# не появляется, хотя окно на экране есть. Проверено на Ubuntu 24.04 с GNOME.
+WM_CLASS_NAME = "home-media-k3s"
+
+
+def _app_icon() -> tk.PhotoImage:
+    """Иконка рисуется прямо здесь, файлом не лежит.
+
+    Причина практическая. Без _NET_WM_ICON панели задач нечего показать рядом с
+    именем окна, а класть картинку в бандл — это лишний файл в сборке и лишний
+    путь, который потом надо искать через sys._MEIPASS. Tk рисует сам, и одной
+    заботой в spec-файле меньше.
+    """
+    size, bg, fg = 64, "#1f6feb", "#ffffff"
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            # Треугольник «плей»: основание слева, вершина справа по центру.
+            along = (x - 20) / 26
+            half = (1 - along) * 16
+            inside = 0.0 <= along <= 1.0 and abs(y - size / 2) <= half
+            row.append(fg if inside else bg)
+        rows.append(tuple(row))
+    icon = tk.PhotoImage(width=size, height=size)
+    icon.put(tuple(rows))
+    return icon
+
 
 class App(tk.Tk):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(className=WM_CLASS_NAME)
         self.title("Домашний медиасервер")
+        # Ссылку на иконку держим сами: PhotoImage без ссылки собирает сборщик
+        # мусора, и окно молча остаётся без иконки.
+        self._icon = _app_icon()
+        self.iconphoto(True, self._icon)
         self.geometry("820x680")
         self.minsize(660, 520)
 
