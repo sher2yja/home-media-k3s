@@ -233,6 +233,30 @@ class App(tk.Tk):
         # Пауза — чтобы не пересчитывать на каждую букву при ручном вводе.
         self.media_dir.trace_add("write", self._media_dir_changed)
 
+        # Логин и пароль торрента. Пустые поля — прежнее поведение: программа
+        # придумает пароль сама и покажет его в конце. Заполнять их незачем
+        # почти никому, поэтому они и стоят ниже папок и подписаны как
+        # необязательные, а не встречают человека первым делом.
+        creds = ttk.LabelFrame(tab, text="Логин и пароль торрента (необязательно)",
+                               padding=PAD)
+        creds.pack(fill="x", pady=(PAD, 0))
+        ttk.Label(creds, foreground="#555", wraplength=720, text=(
+            "Оставьте пустыми — программа придумает пароль сама и покажет его в "
+            "конце установки. Заполните, если хотите свои. Только латинские "
+            "буквы, цифры и знаки: русские буквы qBittorrent примет, а Sonarr и "
+            "Radarr после этого перестанут к нему подключаться."
+        )).pack(anchor="w", pady=(0, 6))
+        row = ttk.Frame(creds)
+        row.pack(fill="x")
+        ttk.Label(row, text="Логин").pack(side="left")
+        self.qbt_login = tk.StringVar()
+        ttk.Entry(row, textvariable=self.qbt_login, width=18).pack(side="left",
+                                                                  padx=(6, 16))
+        ttk.Label(row, text="Пароль").pack(side="left")
+        self.qbt_password = tk.StringVar()
+        ttk.Entry(row, textvariable=self.qbt_password, width=24).pack(side="left",
+                                                                     padx=(6, 0))
+
         self.install_button = ttk.Button(tab, text="Установить", command=self.do_install)
         self.install_button.pack(anchor="w", pady=PAD)
         self.progress = ttk.Progressbar(tab, mode="indeterminate")
@@ -320,12 +344,19 @@ class App(tk.Tk):
                 "Пока не всё готово",
                 "\n\n".join(f"{c.title}: {c.detail}\n{c.fix}" for c in failures))
             return
+        login, password = self.qbt_login.get().strip(), self.qbt_password.get()
+        if login or password:
+            problem = wire.check_credentials(login, password)
+            if problem:
+                messagebox.showwarning("Логин и пароль торрента", problem)
+                return
         drop_monitoring = self._ask_drop_monitoring(profile)
         if drop_monitoring is None:
             return
         self.run_bg(
             lambda log: install.install(profile, config_dir, media_dir, on_line=log,
-                                        drop_monitoring=drop_monitoring),
+                                        drop_monitoring=drop_monitoring,
+                                        qbt_login=login, qbt_password=password),
             self._install_done)
 
     def _ask_drop_monitoring(self, profile_key: str) -> bool | None:
@@ -522,10 +553,80 @@ class App(tk.Tk):
         text = scrolledtext.ScrolledText(tab, wrap="word", state="disabled",
                                          height=16)
         text.pack(fill="both", expand=True)
-        ttk.Button(tab, text=f"Открыть {service.title}",
+        buttons = ttk.Frame(tab)
+        buttons.pack(fill="x", pady=(PAD, 0))
+        ttk.Button(buttons, text=f"Открыть {service.title}",
                    command=lambda s=service: webbrowser.open(config.service_url(s))
-                   ).pack(anchor="w", pady=(PAD, 0))
+                   ).pack(side="left")
+        if key == "qbittorrent":
+            ttk.Button(buttons, text="Сменить логин и пароль",
+                       command=self.ask_credentials).pack(side="left", padx=(6, 0))
         self.guide_texts[key] = text
+
+    def ask_credentials(self) -> None:
+        """Смена логина и пароля торрента на работающей установке.
+
+        Отдельное окошко, а не поля прямо в подвкладке: это действие, которое
+        трогает три места сразу (торрент, Secret, оба *arr), и случайно нажать
+        его не должно быть легко.
+        """
+        if not config.installed():
+            messagebox.showinfo("Медиасервер ещё не установлен",
+                                "Логин и пароль появятся после установки.")
+            return
+        window = tk.Toplevel(self)
+        window.title("Смена логина и пароля торрента")
+        window.transient(self)
+        frame = ttk.Frame(window, padding=PAD)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, wraplength=440, foreground="#555", text=(
+            "Поменяется в трёх местах сразу: в самом qBittorrent, в сохранённых "
+            "настройках и в Sonarr с Radarr — иначе они перестанут к нему "
+            "подключаться и заказы молча перестанут скачиваться.\n\n"
+            "Только латинские буквы, цифры и знаки."
+        )).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, PAD))
+
+        login = tk.StringVar(value=config.qbittorrent_login())
+        password = tk.StringVar()
+        for row, (label, var) in enumerate((("Логин", login),
+                                            ("Новый пароль", password)), start=1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(frame, textvariable=var, width=32).grid(row=row, column=1,
+                                                              sticky="ew", pady=2)
+
+        def apply() -> None:
+            problem = wire.check_credentials(login.get().strip(), password.get())
+            if problem:
+                messagebox.showwarning("Не подходит", problem, parent=window)
+                return
+            new_login, new_password = login.get().strip(), password.get()
+            window.destroy()
+            self.notebook.select(0)   # лог живёт на первой вкладке
+            self.run_bg(
+                lambda log: install.change_qbittorrent_credentials(
+                    new_login, new_password, on_line=log),
+                self._credentials_done)
+
+        ttk.Button(frame, text="Сменить", command=apply).grid(
+            row=3, column=0, sticky="w", pady=(PAD, 0))
+        ttk.Button(frame, text="Отмена", command=window.destroy).grid(
+            row=3, column=1, sticky="e", pady=(PAD, 0))
+
+    def _credentials_done(self, steps) -> None:
+        if isinstance(steps, Exception):
+            messagebox.showerror("Не вышло сменить", str(steps))
+            return
+        failed = [s for s in steps if not s.ok]
+        self._fill_guides()
+        if failed:
+            messagebox.showwarning(
+                "Сменилось не везде",
+                "\n\n".join(f"{s.title}: {s.detail}" for s in failed)
+                + "\n\nНажмите «Связать сервисы» на подвкладке «Все сервисы».")
+        else:
+            messagebox.showinfo("Готово",
+                                "Логин и пароль сменены. Sonarr и Radarr уже знают "
+                                "новые — заказы продолжат скачиваться.")
 
     def _fill_guides(self) -> None:
         """Перерисовывает инструкции. Вызывается и при «Обновить»: до установки

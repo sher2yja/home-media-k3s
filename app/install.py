@@ -333,23 +333,90 @@ def ensure_desktop_entry() -> Path | None:
 QBT_SECRET = "qbittorrent-webui"
 
 
-def create_qbittorrent_secret(on_line=None) -> str | None:
+def create_qbittorrent_secret(on_line=None, login: str = "",
+                              password: str = "") -> str | None:
     """Возвращает новый пароль либо None, если Secret уже был.
 
     Идемпотентность здесь не про аккуратность: пароль сохранён в download client
     Sonarr и Radarr, и молчаливая смена сломала бы им скачивание. Дальше конфиг
     qBittorrent засевает initContainer seed-webui-config, читая хеш отсюда.
+
+    login и password — то, что человек вписал сам при установке. Пустые значит
+    «придумай сама», как было всегда. Пустой пароль сюда не попадает: поле в окне
+    либо заполнено, либо не заполнено, а полупустое состояние ловится там же.
     """
     if kubectl("get", "secret", "-n", "media", QBT_SECRET, timeout=120).returncode == 0:
         return None
-    password = generate_password()
+    password = password or generate_password()
     r = kubectl("create", "secret", "generic", QBT_SECRET, "-n", "media",
+                f"--from-literal=login={login or config.QBT_DEFAULT_LOGIN}",
                 f"--from-literal=password={password}",
                 f"--from-literal=password-pbkdf2={qbittorrent_pbkdf2(password)}",
                 on_line=on_line, timeout=120)
     if r.returncode != 0:
         raise RuntimeError("Не удалось создать пароль торрента: " + r.stdout[-2000:])
     return password
+
+
+def change_qbittorrent_credentials(login: str, password: str,
+                                   on_line=None) -> list[wire.Step]:
+    """Смена логина и пароля торрента на работающей установке.
+
+    Три места, и все три обязательны — пропустить любое значит сломать
+    скачивание молча:
+
+      1. сам торрент, через его API (Secret тут бесполезен: конфиг засевается
+         только при первом запуске, когда файла ещё нет);
+      2. Secret в кластере — на случай, если том с настройками когда-нибудь
+         пересоздадут: засев возьмёт данные оттуда, и они обязаны быть теми же;
+      3. Sonarr и Radarr — они ходят в торрент со своим сохранённым паролем, и со
+         старым просто перестают отдавать раздачи, без единой ошибки.
+
+    Порядок именно такой. Сначала меняем там, где это может не выйти, и только
+    потом записываем в состояние: иначе state.json обещал бы пароль, которым
+    никуда не войти.
+    """
+    state = config.load_state()
+    steps = [wire.set_credentials(state.get("qbittorrent_password", ""),
+                                  login, password)]
+    if on_line:
+        on_line(f"{'✓' if steps[0].ok else '✕'} {steps[0].title}: {steps[0].detail}")
+    if not steps[0].ok:
+        return steps
+
+    update_qbittorrent_secret(login, password, on_line)
+    config.save_state(qbittorrent_login=login, qbittorrent_password=password)
+
+    config_dir = Path(state.get("config_dir") or config.default_config_dir())
+    for service in ("sonarr", "radarr"):
+        key = media.arr_api_key(config_dir, service)
+        step = (wire.update_download_client(service, key, password) if key
+                else wire.Step(f"Торрент в {config.BY_KEY[service].title}", False,
+                               "ключ API не прочитался"))
+        steps.append(step)
+        if on_line:
+            on_line(f"{'✓' if step.ok else '✕'} {step.title}: {step.detail}")
+    return steps
+
+
+def update_qbittorrent_secret(login: str, password: str,
+                              on_line=None) -> subprocess.CompletedProcess:
+    """Перезаписывает Secret одним patch'ем.
+
+    Не delete+create: между удалением и созданием под, если он в этот момент
+    перезапустится, не найдёт Secret и не стартует вовсе. И не запись во
+    временный файл — это пароль, ему на диске делать нечего.
+
+    stringData, а не data: Kubernetes сам кодирует значения, и base64 руками
+    считать не нужно. Поле только на запись, при чтении Secret его не отдаёт.
+    """
+    patch = json.dumps({"stringData": {
+        "login": login,
+        "password": password,
+        "password-pbkdf2": qbittorrent_pbkdf2(password),
+    }})
+    return kubectl("patch", "secret", QBT_SECRET, "-n", "media",
+                   "--type=merge", "-p", patch, on_line=on_line, timeout=120)
 
 
 # --- Перенос в другие папки -------------------------------------------------
@@ -704,7 +771,8 @@ def remove_monitoring(on_line=None) -> subprocess.CompletedProcess:
 
 
 def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
-            drop_monitoring: bool = False) -> dict:
+            drop_monitoring: bool = False, qbt_login: str = "",
+            qbt_password: str = "") -> dict:
     """Полная установка. Возвращает то, что нужно показать человеку.
 
     drop_monitoring ставит окно, когда человек переключился с полного профиля на
@@ -729,7 +797,7 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
     # Namespace нужен раньше Secret'а и томов — они оба в него кладутся.
     kubectl("apply", "-f", str(bundle_root() / "k8s" / "media-stack"
                                / "00-namespace.yaml"), on_line=on_line)
-    password = create_qbittorrent_secret(on_line)
+    password = create_qbittorrent_secret(on_line, qbt_login, qbt_password)
     apply_volumes(config_dir, media_dir, on_line)
     result = apply_stack(on_line)
     if result.returncode == 0:
@@ -750,8 +818,11 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
 
     # Пароль пишем только когда он только что родился: при повторной установке
     # create_qbittorrent_secret вернёт None, и затирать сохранённый было бы потерей.
+    # Логин — вместе с ним и по той же причине: они всегда пара, и записанный
+    # логин при чужом пароле не открыл бы ничего.
     if password:
-        config.save_state(qbittorrent_password=password)
+        config.save_state(qbittorrent_password=password,
+                          qbittorrent_login=qbt_login or config.QBT_DEFAULT_LOGIN)
 
     # Связываем сервисы сразу: между «установлено» и «можно смотреть» иначе лежит
     # полчаса ручной работы в четырёх чужих интерфейсах. Не получилось — не повод

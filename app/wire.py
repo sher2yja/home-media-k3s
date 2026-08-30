@@ -146,14 +146,38 @@ def add_download_client(key: str, api_key: str, password: str) -> Step:
 
     entry["name"] = "qBittorrent"
     entry["enable"] = True
-    qbt = config.BY_KEY["qbittorrent"]
-    _set_field(entry, "host", "qbittorrent")     # k8s-DNS, а не localhost
-    _set_field(entry, "port", qbt.internal_port)
-    _set_field(entry, "username", "admin")
-    _set_field(entry, "password", password)
+    _fill_torrent_fields(entry, password)
     code, _, reason = _api(key, api_key, "/api/v3/downloadclient", data=entry)
     return (Step(title, True, "прописана") if code in (200, 201)
             else _failed(title, code, reason))
+
+
+def _fill_torrent_fields(entry: dict, password: str) -> None:
+    qbt = config.BY_KEY["qbittorrent"]
+    _set_field(entry, "host", "qbittorrent")     # k8s-DNS, а не localhost
+    _set_field(entry, "port", qbt.internal_port)
+    _set_field(entry, "username", config.qbittorrent_login())
+    _set_field(entry, "password", password)
+
+
+def update_download_client(key: str, api_key: str, password: str) -> Step:
+    """Переписывает логин и пароль в уже прописанном торренте Sonarr или Radarr.
+
+    Нужна после смены пароля: add_download_client находит запись по имени и молча
+    уходит, поэтому сам он старые данные не поправит. А со старым паролем *arr
+    перестают отдавать раздачи в скачивание — молча, это видно только тем, что
+    заказы висят.
+    """
+    title = f"Торрент в {config.BY_KEY[key].title}"
+    _, existing, _ = _api(key, api_key, "/api/v3/downloadclient")
+    mine = next((c for c in existing or [] if c.get("name") == "qBittorrent"), None)
+    if not mine:
+        return add_download_client(key, api_key, password)
+    _fill_torrent_fields(mine, password)
+    code, _, reason = _api(key, api_key, f"/api/v3/downloadclient/{mine['id']}",
+                           data=mine, method="PUT")
+    return (Step(title, True, "новые логин и пароль прописаны")
+            if code in (200, 201, 202) else _failed(title, code, reason))
 
 
 # Метка, которой помечается прокси. Без неё Prowlarr его просто не применяет —
@@ -268,6 +292,95 @@ def tag_indexers(prowlarr_key: str) -> Step:
     return Step(title, True, "помечены: " + ", ".join(marked))
 
 
+class _Torrent:
+    """Сессия к qBittorrent: у него не ключ в заголовке, а кука.
+
+    Отдельный маленький клиент, потому что общий помощник _api сюда не подходит,
+    а нужен он теперь дважды — задать папку и сменить логин с паролем.
+    """
+
+    def __init__(self) -> None:
+        self.base = config.service_url(config.BY_KEY["qbittorrent"])
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+
+    def post(self, path: str, fields: dict):
+        return self.opener.open(urllib.request.Request(
+            f"{self.base}{path}", data=urllib.parse.urlencode(fields).encode(),
+            headers={"Referer": self.base}), timeout=media.TIMEOUT)
+
+    def preferences(self) -> dict:
+        return json.loads(self.opener.open(f"{self.base}/api/v2/app/preferences",
+                                           timeout=media.TIMEOUT).read())
+
+    def login(self, password: str, username: str | None = None) -> bool:
+        """Признак удачного входа — кука QBT_SID, а не тело ответа.
+
+        qBittorrent 5.2+ отвечает на успех 204 No Content, и проверка по телу
+        даёт ложный провал на верном пароле.
+        """
+        self.post("/api/v2/auth/login",
+                  {"username": username or config.qbittorrent_login(),
+                   "password": password})
+        return any(c.name.startswith("QBT_SID") for c in self.jar)
+
+
+# Минимальная длина взята у самого qBittorrent: короче он пароль не принимает.
+MIN_PASSWORD = 6
+
+
+def check_credentials(login: str, password: str) -> str:
+    """Пустая строка значит «годится», иначе — что сказать человеку.
+
+    Латиница обязательна, и это не вкусовщина, а измерение. С кириллическим
+    логином или паролем qBittorrent пароль меняет и сам пускает, а Sonarr с
+    Radarr получают от него 401 на /api/v2/app/webapiVersion и отвечают
+    «Unable to connect to qBittorrent». То есть человек сменил бы пароль, увидел
+    бы, что вход работает, — и заказы перестали бы скачиваться, без единой
+    заметной ошибки. Проверено на живой установке, обе половины по отдельности.
+    """
+    if not login or not password:
+        return "Заполните оба поля — логин и пароль."
+    for value, what in ((login, "Логин"), (password, "Пароль")):
+        if not value.isascii():
+            return (f"{what} должен быть на латинице. Русские буквы qBittorrent "
+                    "принимает, а Sonarr и Radarr после этого перестают к нему "
+                    "подключаться — и заказы молча перестают скачиваться.")
+        if value.strip() != value:
+            return f"{what} не должен начинаться или заканчиваться пробелом."
+    if len(password) < MIN_PASSWORD:
+        return f"Пароль короче {MIN_PASSWORD} знаков qBittorrent не примет."
+    return ""
+
+
+def set_credentials(current_password: str, login: str, password: str) -> Step:
+    """Меняет логин и пароль торрента на уже установленной системе.
+
+    Через API, а не пересозданием Secret'а: конфиг засевается initContainer'ом
+    только когда файла ещё нет, и на работающей установке новый Secret не изменил
+    бы ничего — человек бы решил, что пароль сменился, а он бы остался прежним.
+
+    Успех проверяется не кодом ответа, а входом с НОВЫМИ данными в чистой сессии:
+    setPreferences отвечает 200 и на то, что не применилось.
+    """
+    title = "Логин и пароль торрента"
+    problem = check_credentials(login, password)
+    if problem:
+        return Step(title, False, problem)
+    try:
+        torrent = _Torrent()
+        if not torrent.login(current_password):
+            return Step(title, False, "прежний пароль не подошёл — сменить не вышло")
+        torrent.post("/api/v2/app/setPreferences", {"json": json.dumps(
+            {"web_ui_username": login, "web_ui_password": password})})
+        if not _Torrent().login(password, username=login):
+            return Step(title, False, "торрент не принял новые данные")
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        return Step(title, False, f"торрент не ответил: {error}")
+    return Step(title, True, f"логин {login}, пароль сменён")
+
+
 def set_download_dir(password: str) -> Step:
     """Говорит торренту, куда складывать скачанное.
 
@@ -282,32 +395,16 @@ def set_download_dir(password: str) -> Step:
     сессия с кукой, и общий помощник для *arr сюда не подходит.
     """
     title = "Папка для скачивания в торренте"
-    base = config.service_url(config.BY_KEY["qbittorrent"])
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-
-    def post(path: str, fields: dict):
-        return opener.open(urllib.request.Request(
-            f"{base}{path}", data=urllib.parse.urlencode(fields).encode(),
-            headers={"Referer": base}), timeout=media.TIMEOUT)
-
-    def preferences() -> dict:
-        return json.loads(opener.open(f"{base}/api/v2/app/preferences",
-                                      timeout=media.TIMEOUT).read())
-
+    torrent = _Torrent()
     try:
-        post("/api/v2/auth/login", {"username": "admin", "password": password})
-        # Признак удачного входа — кука QBT_SID, а не тело ответа: qBittorrent
-        # 5.2+ отвечает на успех 204 No Content, и проверка по телу даёт ложный
-        # провал на верном пароле.
-        if not any(c.name.startswith("QBT_SID") for c in jar):
+        if not torrent.login(password):
             return Step(title, False, "торрент не принял пароль")
-        if preferences().get("save_path", "").rstrip("/") == config.DOWNLOADS_DIR:
+        if torrent.preferences().get("save_path", "").rstrip("/") == config.DOWNLOADS_DIR:
             return Step(title, True, f"уже {config.DOWNLOADS_DIR}")
-        post("/api/v2/app/setPreferences",
-             {"json": json.dumps({"save_path": config.DOWNLOADS_DIR})})
+        torrent.post("/api/v2/app/setPreferences",
+                     {"json": json.dumps({"save_path": config.DOWNLOADS_DIR})})
         # Проверяем не код ответа на запись, а то, что торрент теперь говорит сам.
-        saved = preferences().get("save_path", "").rstrip("/")
+        saved = torrent.preferences().get("save_path", "").rstrip("/")
     except (urllib.error.URLError, OSError, ValueError) as error:
         return Step(title, False, f"торрент не ответил: {error}")
     if saved != config.DOWNLOADS_DIR:
@@ -446,6 +543,16 @@ def _self_check() -> None:
     values = {f["name"]: f["value"] for f in entry["fields"]}
     assert values["host"] == "qbittorrent"
     assert values["password"] == "секрет"
+
+    # Правило про латиницу: ослабить его правкой легко, а сломается от этого не
+    # торрент, а скачивание в Sonarr и Radarr — молча.
+    assert check_credentials("admin", "Parol-77") == ""
+    assert check_credentials("admin", "a&b=c%d+e!") == ""
+    assert "латинице" in check_credentials("вася", "Parol-77")
+    assert "латинице" in check_credentials("admin", "Пароль-77")
+    assert "Заполните" in check_credentials("", "Parol-77")
+    assert "короче" in check_credentials("admin", "abc")
+    assert "пробелом" in check_credentials("admin", " Parol-77")
     assert values["port"] == 1, "лишние поля трогать нельзя"
 
     # Адреса для связок — только внутренние: снаружи их не видно из пода.

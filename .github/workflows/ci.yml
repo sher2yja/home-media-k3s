@@ -336,12 +336,16 @@ jobs:
           python - <<'PY'
           import pathlib, sys
           sys.path.insert(0, 'app')
-          import install
+          import config, install
           home = pathlib.Path.home()
+          # Свой логин, а не умолчание: только так проверяется дорога
+          # «поле в окне -> Secret -> initContainer -> конфиг qBittorrent».
+          # С admin она неотличима от прежнего поведения.
           result = install.install('simple', home / 'hm-config', home / 'hm-media',
-                                   on_line=print)
+                                   on_line=print, qbt_login='kinoman')
           assert result['ok'], 'установка вернула ok=False'
           assert result['qbittorrent_password'], 'пароль торрента не создан'
+          assert config.qbittorrent_login() == 'kinoman', config.qbittorrent_login()
           PY
 
       # install.install() уже дождался связывания и упал бы, если бы его не было.
@@ -491,6 +495,55 @@ jobs:
           print(f'повторный вызов: {again.detail}')
 
           wire._api('prowlarr', key, f"/api/v1/indexer/{made['id']}", method='DELETE')
+          PY
+
+      # Смена пароля трогает три места сразу, и пропуск любого ломает скачивание
+      # молча: Sonarr и Radarr ходят в торрент со своим сохранённым паролем и со
+      # старым просто перестают отдавать раздачи, без единой ошибки.
+      - name: Логин и пароль торрента меняются во всех трёх местах
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, 'app')
+          import config, install, media, wire
+
+          config_dir = pathlib.Path.home() / 'hm-config'
+
+          # Заданный человеком логин доехал до самого qBittorrent, а не только до
+          # state.json: спрашиваем сам сервис, входя под ним.
+          old_password = config.load_state()['qbittorrent_password']
+          assert wire._Torrent().login(old_password), (
+              'вход логином из установки не прошёл — Secret до конфига не доехал')
+          print(f'вход логином {config.qbittorrent_login()} из установки: прошёл')
+
+          steps = install.change_qbittorrent_credentials('kinolub', 'Parol-Proverki-77',
+                                                         on_line=print)
+          failed = [s for s in steps if not s.ok]
+          assert not failed, f'не сменилось: {[(s.title, s.detail) for s in failed]}'
+
+          # Проверяем не свой возврат, а состояние сервисов.
+          assert wire._Torrent().login('Parol-Proverki-77', username='kinolub'), (
+              'новыми данными войти не удалось')
+          assert config.qbittorrent_login() == 'kinolub'
+          for service in ('sonarr', 'radarr'):
+              key = media.arr_api_key(config_dir, service)
+              _, clients, _ = wire._api(service, key, '/api/v3/downloadclient')
+              mine = [c for c in clients if c['name'] == 'qBittorrent']
+              assert len(mine) == 1, f'{service}: торрентов {len(mine)}'
+              fields = {f['name']: f.get('value') for f in mine[0]['fields']}
+              assert fields['username'] == 'kinolub', (
+                  f"{service}: остался логин {fields['username']!r}")
+              print(f'{service}: логин обновлён на {fields["username"]}')
+
+          # Кириллицу нельзя пускать дальше окна: qBittorrent её принимает, а
+          # Sonarr с Radarr после неё отвечают 401. Измерено на живой установке.
+          assert 'латинице' in wire.check_credentials('вася', 'Parol-77')
+          assert 'латинице' in wire.check_credentials('admin', 'Пароль-77')
+          step = wire.set_credentials('Parol-Proverki-77', 'admin', 'Пароль-77')
+          assert not step.ok, 'кириллический пароль прошёл проверку'
+          assert wire._Torrent().login('Parol-Proverki-77', username='kinolub'), (
+              'отказ в смене не должен был ничего менять')
+          print('кириллица отклонена, прежние данные не тронуты')
           PY
 
       # Права на папку — то, из-за чего связывание падало с 400 без объяснения.

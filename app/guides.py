@@ -199,11 +199,19 @@ def _qbittorrent(password: str | None) -> list[str]:
     if password:
         lines += [
             "ЛОГИН И ПАРОЛЬ",
-            "     Логин:   admin",
+            f"     Логин:   {config.qbittorrent_login()}",
             f"     Пароль:  {password}",
             "",
-            ("Пароль создан при установке и уже вписан в Sonarr и Radarr. Он "
-             "нужен, только если вы полезете в настройки сами."),
+            ("Уже вписаны в Sonarr и Radarr, вам они нужны, только если полезете "
+             "в настройки сами."),
+            "",
+            "СМЕНИТЬ ИХ",
+            ("Кнопкой «Сменить логин и пароль» внизу. Менять их прямо в "
+             "qBittorrent нельзя: Sonarr и Radarr останутся со старыми, "
+             "перестанут к нему подключаться, и заказы молча перестанут "
+             "скачиваться. Кнопка меняет во всех трёх местах сразу."),
+            ("Только латинские буквы, цифры и знаки — русские буквы qBittorrent "
+             "принимает, а Sonarr и Radarr после них к нему не подключаются."),
             "",
         ]
     lines += [
@@ -266,7 +274,9 @@ def _self_check() -> None:
 
     torrent = "\n".join(lines("qbittorrent", password="секрет"))
     assert "секрет" in torrent and config.DOWNLOADS_DIR in torrent
-    assert "Пароль" not in "\n".join(lines("qbittorrent"))
+    # Логин не вписан словом, а берётся из состояния: человек может задать свой.
+    assert config.qbittorrent_login() in torrent
+    assert "Пароль:" not in "\n".join(lines("qbittorrent"))
 
     try:
         lines("нет-такого")

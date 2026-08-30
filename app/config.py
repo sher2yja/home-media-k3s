@@ -206,6 +206,12 @@ def service_url(service: Service, host: str = "localhost") -> str:
 # страницей «Dashboard not found», то есть сломанная кнопка выглядела бы рабочей.
 GRAFANA_DASHBOARD_UID = "home-media"
 
+# Логин торрента по умолчанию. Человек может задать свой при установке, и тогда
+# он лежит в state.json под ключом qbittorrent_login. Значение отсюда берётся
+# только когда своего нет: у старых установок его в состоянии просто не было.
+QBT_DEFAULT_LOGIN = "admin"
+
+
 
 def grafana_dashboard_url(host: str = "localhost") -> str:
     """Адрес готового дашборда, а не главной Grafana.
@@ -249,3 +255,13 @@ def save_state(**values) -> dict:
 
 def installed() -> bool:
     return bool(load_state().get("profile"))
+
+
+def qbittorrent_login() -> str:
+    """Логин торрента: свой, если человек его задал, иначе admin.
+
+    Отдельная функция, а не чтение состояния по месту: логин нужен в четырёх
+    местах — при засеве конфига, в download client Sonarr и Radarr, при входе в
+    API торрента и в инструкции на экране. Захардкоженный admin там и лежал.
+    """
+    return load_state().get("qbittorrent_login") or QBT_DEFAULT_LOGIN

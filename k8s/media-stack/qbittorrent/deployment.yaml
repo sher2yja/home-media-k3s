@@ -32,7 +32,7 @@ spec:
         # Хеш берётся из Secret qbittorrent-webui, а НЕ из этого файла: репозиторий
         # публичный и раздаётся релизами, иначе один пароль достался бы всем, кто
         # скачал. Создать Secret: infra/vms/scripts/08-qbittorrent-secret.sh
-        # Логин: admin.
+        # Логин берётся из того же Secret, ключ login; по умолчанию admin.
         - name: seed-webui-config
           image: busybox:1.36
           command:
@@ -53,7 +53,7 @@ spec:
                   'WebUI\Address=*' \
                   'WebUI\ServerDomains=*' \
                   'WebUI\HostHeaderValidation=false' \
-                  'WebUI\Username=admin' \
+                  "WebUI\\Username=${QBT_LOGIN:-admin}" \
                   "WebUI\\Password_PBKDF2=\"${QBT_PASSWORD_HASH}\"" \
                   > "$CONF"
                 echo "qBittorrent.conf засеян путём для скачивания, дефолтами WebUI и паролем из Secret"
@@ -64,6 +64,16 @@ spec:
                 secretKeyRef:
                   name: qbittorrent-webui
                   key: password-pbkdf2
+            # optional: true — не перестраховка. Secret'ы, созданные до появления
+            # этого ключа (в том числе скриптом стенда), его не содержат, и без
+            # optional под не запустился бы вовсе: kubelet не создаёт контейнер с
+            # отсутствующим ключом. Значение по умолчанию подставляет сам shell.
+            - name: QBT_LOGIN
+              valueFrom:
+                secretKeyRef:
+                  name: qbittorrent-webui
+                  key: login
+                  optional: true
           volumeMounts:
             - name: config
               mountPath: /config
