@@ -78,7 +78,7 @@ SERVICES: tuple[Service, ...] = (
         title="qBittorrent",
         port=30880,
         internal_port=8080,
-        blurb="Качалка. Работает сама, заходить сюда обычно не нужно.",
+        blurb="Торрент. Работает сам, заходить сюда обычно не нужно.",
         user_facing=False,
     ),
 )
@@ -166,7 +166,7 @@ def internal_url(key: str) -> str:
 
     Не путать с service_url(): та даёт адрес для человека и браузера, снаружи и
     по NodePort. Внутри кластера работает k8s-DNS и РОДНЫЕ порты — если подставить
-    сюда внешний порт, Sonarr не найдёт качалку, а Prowlarr — Sonarr.
+    сюда внешний порт, Sonarr не найдёт торрент, а Prowlarr — Sonarr.
     """
     service = BY_KEY[key]
     return f"http://{key}:{service.internal_port}"

@@ -1,7 +1,7 @@
 """Связывание сервисов между собой через их API.
 
 То, что человек иначе делает руками полчаса: сказать Prowlarr про Sonarr и Radarr,
-показать обоим качалку с паролем, задать корневые папки и включить hardlink'и.
+показать обоим торрент с паролем, задать корневые папки и включить hardlink'и.
 Каждый шаг — несколько кликов в чужом интерфейсе с копированием ключей API из
 одного окна в другое, и каждый можно молча сделать не так.
 
@@ -11,7 +11,7 @@
 Три принципа, от которых тут нельзя отступать:
 
 1. **Идемпотентность.** Кнопку нажмут дважды. Каждый шаг сначала смотрит, нет ли
-   уже такой записи, и только потом создаёт. Иначе в Sonarr появятся три качалки.
+   уже такой записи, и только потом создаёт. Иначе в Sonarr появятся три торрента.
 2. **Схему просим у сервиса, а не выдумываем.** У Sonarr, Radarr и Prowlarr поля
    настроек описаны в /schema, и набор полей меняется между версиями. Захардкоженный
    набор однажды разъедется с сервисом и даст ошибку, в которой не будет ни слова
@@ -134,8 +134,8 @@ def _set_field(entry: dict, name: str, value) -> None:
 # --- Шаги -------------------------------------------------------------------
 
 def add_download_client(key: str, api_key: str, password: str) -> Step:
-    """Качалка в Sonarr или Radarr. Без неё они находят раздачу и не могут её взять."""
-    title = f"Качалка в {config.BY_KEY[key].title}"
+    """Торрент в Sonarr или Radarr. Без него они находят раздачу и не могут её взять."""
+    title = f"Торрент в {config.BY_KEY[key].title}"
     _, existing, _ = _api(key, api_key, "/api/v3/downloadclient")
     if any(c.get("name") == "qBittorrent" for c in existing or []):
         return Step(title, True, "уже прописана")
@@ -269,7 +269,7 @@ def tag_indexers(prowlarr_key: str) -> Step:
 
 
 def set_download_dir(password: str) -> Step:
-    """Говорит качалке, куда складывать скачанное.
+    """Говорит торренту, куда складывать скачанное.
 
     Сама она этого не знает: по умолчанию qBittorrent сохраняет в свой
     /config/Downloads — то есть на том с настройками, а не на том с медиатекой.
@@ -278,10 +278,10 @@ def set_download_dir(password: str) -> Step:
     делают копию вместо неё. Каждый фильм занимает место дважды, ошибки при этом
     нет ни одной. Ровно ради совпадения томов downloads и library и лежат рядом.
 
-    Ходим сюда своим клиентом, а не через _api: у качалки не ключ в заголовке, а
+    Ходим сюда своим клиентом, а не через _api: у торрента не ключ в заголовке, а
     сессия с кукой, и общий помощник для *arr сюда не подходит.
     """
-    title = "Папка для скачивания в качалке"
+    title = "Папка для скачивания в торренте"
     base = config.service_url(config.BY_KEY["qbittorrent"])
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -301,15 +301,15 @@ def set_download_dir(password: str) -> Step:
         # 5.2+ отвечает на успех 204 No Content, и проверка по телу даёт ложный
         # провал на верном пароле.
         if not any(c.name.startswith("QBT_SID") for c in jar):
-            return Step(title, False, "качалка не приняла пароль")
+            return Step(title, False, "торрент не принял пароль")
         if preferences().get("save_path", "").rstrip("/") == config.DOWNLOADS_DIR:
             return Step(title, True, f"уже {config.DOWNLOADS_DIR}")
         post("/api/v2/app/setPreferences",
              {"json": json.dumps({"save_path": config.DOWNLOADS_DIR})})
-        # Проверяем не код ответа на запись, а то, что качалка теперь говорит сама.
+        # Проверяем не код ответа на запись, а то, что торрент теперь говорит сам.
         saved = preferences().get("save_path", "").rstrip("/")
     except (urllib.error.URLError, OSError, ValueError) as error:
-        return Step(title, False, f"качалка не ответила: {error}")
+        return Step(title, False, f"торрент не ответил: {error}")
     if saved != config.DOWNLOADS_DIR:
         return Step(title, False, f"осталась {saved!r}")
     return Step(title, True, f"{config.DOWNLOADS_DIR} — на одном томе с библиотекой, "
@@ -407,7 +407,7 @@ def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
                      "сервис ещё не создал свой ключ — подождите пару минут "
                      "и нажмите кнопку снова"))
 
-    # Куда качать — настройка одна на всю качалку, поэтому до цикла по сервисам.
+    # Куда качать — настройка одна на весь торрент, поэтому до цикла по сервисам.
     if password:
         log(set_download_dir(password))
 
@@ -423,8 +423,8 @@ def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
         if password:
             log(add_download_client(service, keys[service], password))
         else:
-            log(Step(f"Качалка в {config.BY_KEY[service].title}", False,
-                     "пароль качалки не найден — он создаётся при установке"))
+            log(Step(f"Торрент в {config.BY_KEY[service].title}", False,
+                     "пароль торрента не найден — он создаётся при установке"))
         log(add_root_folder(service, keys[service]))
         log(enable_hardlinks(service, keys[service]))
         if keys.get("prowlarr"):

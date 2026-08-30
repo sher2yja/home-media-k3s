@@ -21,6 +21,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import config
+import guides
 import icon
 import install
 import media
@@ -409,11 +410,11 @@ class App(tk.Tk):
 
     def _password_dialog(self, password: str) -> None:
         window = tk.Toplevel(self)
-        window.title("Запишите пароль качалки")
+        window.title("Запишите пароль торрента")
         frame = ttk.Frame(window, padding=PAD)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, wraplength=460, text=(
-            "Пароль понадобится, только если вы полезете в настройки качалки. "
+            "Пароль понадобится, только если вы полезете в настройки торрента. "
             "Логин admin, пароль:")).pack(anchor="w")
         entry = ttk.Entry(frame, width=30, font=("TkFixedFont", 12))
         entry.insert(0, password)
@@ -429,17 +430,38 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(text)
 
-    # --- Вкладка «Мой сервер» -----------------------------------------------
+    # --- Вкладка «Настройки сервера» -----------------------------------------
 
     def _build_dashboard_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=PAD)
-        self.notebook.add(tab, text="Мой сервер")
+        self.notebook.add(tab, text="Настройки сервера")
 
         ttk.Label(tab, text="Ваш медиасервер",
                   font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        # Надпись говорит правду, а не «настройте все шесть»: три сервиса
+        # настраивает wire.configure, и человек, пошедший искать в них настройки,
+        # потратит время впустую. Список берётся из guides.NEEDS_SETUP, чтобы не
+        # разъехаться с подвкладками.
+        need = ", ".join(config.BY_KEY[k].title for k in guides.NEEDS_SETUP)
         ttk.Label(tab, foreground="#555", wraplength=760, text=(
-            "Всё, что ниже, работает на этом компьютере — пока он включён."
+            f"Три сервера нужно настроить самому — {need}: в них нужен ваш "
+            "выбор, и за вас его никто не сделает. Откройте подвкладку и следуйте "
+            "инструкции. Остальные программа настроила сама; их подвкладки нужны, "
+            "только если захотите проверить.\n"
+            "Всё это работает на этом компьютере — пока он включён."
         )).pack(anchor="w", pady=(0, PAD))
+
+        self.server_tabs = ttk.Notebook(tab)
+        self.server_tabs.pack(fill="both", expand=True)
+        self._build_services_subtab()
+        self.guide_texts = {}
+        for key in guides.ORDER:
+            self._build_guide_subtab(key)
+        self._fill_guides()
+
+    def _build_services_subtab(self) -> None:
+        tab = ttk.Frame(self.server_tabs, padding=PAD)
+        self.server_tabs.add(tab, text="Все сервисы")
 
         self.services_frame = ttk.Frame(tab)
         self.services_frame.pack(fill="both", expand=True)
@@ -454,15 +476,42 @@ class App(tk.Tk):
         self.repair_button = ttk.Button(buttons, text="Перепроверить и починить",
                                         command=self.do_repair)
         self.repair_button.pack(side="left", padx=(6, 0))
-        ttk.Label(tab, foreground="#555", wraplength=760, text=(
-            "«Связать сервисы» — рассказывает сервисам друг о друге: поиск, качалку, "
+        ttk.Label(tab, foreground="#555", wraplength=740, text=(
+            "«Связать сервисы» — рассказывает сервисам друг о друге: поиск, торрент, "
             "куда складывать готовое. Делается при установке само, кнопка нужна, "
-            "если что-то не успело подняться.\n"
+            "если что-то не успело подняться или если вы добавили сайт в Prowlarr.\n"
             "«Перепроверить и починить» возвращает сервисы к правильным настройкам. "
             "Фильмы и настройки при этом не пропадают."
         )).pack(anchor="w")
 
+    def _build_guide_subtab(self, key: str) -> None:
+        service = config.BY_KEY[key]
+        tab = ttk.Frame(self.server_tabs, padding=PAD)
+        self.server_tabs.add(tab, text=service.title)
+        text = scrolledtext.ScrolledText(tab, wrap="word", state="disabled",
+                                         height=16)
+        text.pack(fill="both", expand=True)
+        ttk.Button(tab, text=f"Открыть {service.title}",
+                   command=lambda s=service: webbrowser.open(config.service_url(s))
+                   ).pack(anchor="w", pady=(PAD, 0))
+        self.guide_texts[key] = text
+
+    def _fill_guides(self) -> None:
+        """Перерисовывает инструкции. Вызывается и при «Обновить»: до установки
+        ключей API и пароля ещё нет, и в тексте на их месте стоит оговорка."""
+        state = config.load_state()
+        config_dir = Path(state.get("config_dir") or config.default_config_dir())
+        keys = {name: media.arr_api_key(config_dir, name)
+                for name in ("sonarr", "radarr")}
+        password = state.get("qbittorrent_password")
+        for key, widget in self.guide_texts.items():
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "\n".join(guides.lines(key, keys, password)))
+            widget.configure(state="disabled")
+
     def refresh_dashboard(self) -> None:
+        self._fill_guides()
         for child in self.services_frame.winfo_children():
             child.destroy()
         ttk.Label(self.services_frame, text="Спрашиваю сервисы…").pack(anchor="w")
@@ -626,100 +675,19 @@ class App(tk.Tk):
         state = config.load_state()
         password = state.get("qbittorrent_password")
         profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
-        # Ключи API сервисы генерируют себе сами при первом запуске. Человеку они
-        # нужны ровно один раз — в мастере Jellyseerr, — и лезть за ними в чужие
-        # настройки незачем: читаем из тех же config.xml, что и всё остальное.
-        config_dir = Path(state.get("config_dir") or config.default_config_dir())
-        keys = {name: media.arr_api_key(config_dir, name)
-                for name in ("sonarr", "radarr")}
         blocks = [
-            "ЧТО НУЖНО СДЕЛАТЬ ОДИН РАЗ ПОСЛЕ УСТАНОВКИ",
+            "НАСТРОЙКА СЕРВЕРОВ ПЕРЕЕХАЛА",
+            ("Пошаговые инструкции — что нажать в Jellyfin, Prowlarr и "
+             "Jellyseerr — теперь на вкладке «Настройки сервера», по подвкладке "
+             "на каждый сервис. Там же видно, какие сервисы настраивать не "
+             "нужно вовсе."),
             "",
-            ("Программа уже связала сервисы между собой: рассказала им про поиск, "
-             "про качалку и про то, куда складывать готовое. Осталось три шага, "
-             "которые за вас никто не сделает — в них нужен ваш выбор."),
-            "",
-            "ШАГ 1. Завести себя в Jellyfin и показать ему папки",
-            "1. Откройте Jellyfin на вкладке «Мой сервер».",
-            ("2. Он попросит придумать логин и пароль — это ваша учётная запись, "
-             "ею же вы будете входить с телефона и телевизора."),
-            "3. Когда спросит про медиатеку, добавьте две:",
-            f"     «Фильмы»  -> {config.ROOT_FOLDERS['radarr']}",
-            f"     «Сериалы» -> {config.ROOT_FOLDERS['sonarr']}",
-            ("   Указывайте именно эти пути и именно эту глубину: папку НАД "
-             "фильмами, а не сам фильм. Иначе Jellyfin ничего не найдёт."),
-            "",
-            "ШАГ 2. Выбрать, где искать (Prowlarr)",
-            "1. Откройте Prowlarr на вкладке «Мой сервер».",
-            ("2. «Indexers» -> «Add Indexer» и добавьте те сайты, которыми "
-             "пользуетесь."),
-            ("3. Добавили сайт — вернитесь сюда, на вкладку «Мой сервер», и "
-             "нажмите «Связать сервисы». Про Sonarr и Radarr Prowlarr уже "
-             "знает, а вот метку обхода проверки «вы не робот» на новый сайт "
-             "ставит именно эта кнопка."),
-            "",
-            ("Если «Test» отвечает «403 Forbidden» за пару секунд — это как раз "
-             "тот случай: сайт отдал проверку «вы не робот», а обход не "
-             "включился, потому что метки нет. Нажмите «Связать сервисы» и "
-             "повторите "
-             "«Test». Когда обход работает, «Test» думает секунд "
-             "пятнадцать-тридцать — это нормально, в это время проверка и "
-             "проходится."),
-            "",
-            ("Если «Test» отвечает «Name does not resolve», а сайт при этом "
-             "открывается у вас в браузере — дело обычно не в медиасервере, а в "
-             "том, у кого он спрашивает адреса сайтов. Строка «Поиск адресов "
-             "сайтов (DNS)» на вкладке «Установка» показывает, у кого именно; "
-             "разбор — в MANUAL.md."),
-            "",
-            ("Это единственный шаг, который нельзя сделать за вас: список сайтов "
-             "у каждого свой, а некоторые требуют регистрации."),
-            "",
-            "ШАГ 3. Пройти мастер Jellyseerr",
-            "1. Откройте Jellyseerr на вкладке «Мой сервер».",
-            "2. Первым делом он спросит адрес Jellyfin. Впишите ровно это:",
-            f"     Jellyfin URL: {config.BY_KEY['jellyfin'].key}",
-            f"     Port:         {config.BY_KEY['jellyfin'].internal_port}",
-            ("   В верхнее поле идёт ИМЯ буквами, в нижнее — порт. Вписать 8096 "
-             "в оба — самая частая ошибка: форма зависнет на «Signing In...»."),
-            ("   И не localhost, и не адрес из браузера: Jellyseerr живёт рядом с "
-             "Jellyfin внутри сервера, localhost для него — он сам."),
-            "3. Логин и пароль — те же, что вы завели в Jellyfin на шаге 1.",
-            ("4. Экран «Configure Media Server»: нажмите «Sync Libraries», включите "
-             "обе медиатеки — «Фильмы» и «Сериалы» — и нажмите «Start Scan»."),
-            ("   Выключенную медиатеку Jellyseerr не увидит. Скан идёт в фоне, "
-             "ждать его не нужно."),
-            ("   В «Jellyfin Settings» ниже не трогайте ничего: ключ создан сам, "
-             "External URL и Forgot Password URL оставьте пустыми."),
-            ("   Список медиатек пуст даже после «Sync Libraries» — значит на шаге 1 "
-             "они не заведены. Вернитесь в Jellyfin и добавьте обе."),
-            "5. Экран «Configure Services»: добавьте два сервера, Radarr и Sonarr.",
-            "   Поля заполняются так:",
-            "     Server Name             radarr            sonarr",
-            "     Hostname or IP Address  radarr            sonarr",
-            (f"     Port                    {config.BY_KEY['radarr'].internal_port}"
-             f"              {config.BY_KEY['sonarr'].internal_port}"),
-            "     Use SSL, URL Base       выключено, пусто",
-            ("   Поле «API Key» пустое, и само оно не заполнится — вставьте ключ "
-             "отсюда:"),
-            f"     Radarr API Key: {keys['radarr'] or 'не удалось прочитать'}",
-            f"     Sonarr API Key: {keys['sonarr'] or 'не удалось прочитать'}",
-            ("   Только ПОСЛЕ ключа жмите «Test»: по нему подтягиваются списки "
-             "«Quality Profile» и «Root Folder». Без ключа они пустые."),
-            "   В «Root Folder» выберите ту папку, что уже там есть:",
-            f"     Radarr: {config.ROOT_FOLDERS['radarr']}",
-            f"     Sonarr: {config.ROOT_FOLDERS['sonarr']}",
-            ("   «Quality Profile» — на ваш вкус, например HD-1080p. Остальные "
-             "переключатели оставьте как есть и нажмите «Add Server»."),
-            "",
-            ("ПРОВЕРЬТЕ, ЧТО НЕ ЗАДВОИЛОСЬ: Jellyseerr легко принимает Sonarr за "
-             "второй Radarr — формы у них одинаковые, и зелёная кнопка «Test» это "
-             "не ловит. Сериалы должны быть в разделе Sonarr, фильмы — в Radarr."),
+            "Здесь осталось то, чем пользуются каждый день.",
             "",
             "=" * 60,
             "",
             "ПОСМОТРЕТЬ ФИЛЬМ",
-            "1. Откройте Jellyfin на вкладке «Мой сервер».",
+            "1. Откройте Jellyfin на вкладке «Настройки сервера».",
             "2. Выберите фильм и нажмите «Смотреть».",
             "",
             ("С телевизора или телефона: установите приложение Jellyfin и укажите "
@@ -727,7 +695,7 @@ class App(tk.Tk):
              f"{config.BY_KEY['jellyfin'].port}."),
             "",
             "ЗАКАЗАТЬ ФИЛЬМ, КОТОРОГО НЕТ",
-            "1. Откройте Jellyseerr на вкладке «Мой сервер».",
+            "1. Откройте Jellyseerr на вкладке «Настройки сервера».",
             "2. Найдите фильм или сериал через поиск и нажмите «Запросить».",
             "",
             ("Дальше система ищет и качает сама. Следить за этим — на вкладке "
@@ -749,17 +717,17 @@ class App(tk.Tk):
             "ЧАСТЫЕ ВОПРОСЫ",
             "",
             "Что будет, если нажать «Установить» ещё раз?",
-            ("Ничего не сломается. Пароль качалки останется прежним, фильмы и "
+            ("Ничего не сломается. Пароль торрента останется прежним, фильмы и "
              "настройки — на месте: программа просто заново приведёт сервисы к "
              "правильному состоянию. Но чаще нужна не эта кнопка, а "
-             "«Перепроверить и починить» на вкладке «Мой сервер» — то же самое, "
+             "«Перепроверить и починить» на вкладке «Настройки сервера» — то же самое, "
              "только сразу."),
             "",
             "Что будет, если выключить компьютер?",
             ("Настраивать заново не придётся ничего. Сервер поднимется сам при "
              "следующем включении: он стоит системной службой, а фильмы и "
              "настройки лежат обычными папками на диске. Первую пару минут после "
-             "включения на вкладке «Мой сервер» будут крестики — это сервисы "
+             "включения на вкладке «Настройки сервера» будут крестики — это сервисы "
              "просыпаются. Сама программа для работы сервера не нужна вовсе, "
              "она пульт."),
             "",

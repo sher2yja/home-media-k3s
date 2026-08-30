@@ -33,6 +33,7 @@ cd app && python3 media.py      # разбор очередей *arr и стат
 cd app && python3 install.py    # шаблон томов, пункт меню, перенос со ссылками
 cd app && python3 wire.py       # подстановка полей в схему настроек, разбор причины отказа
 cd app && python3 icon.py       # кодирование PNG без сторонних библиотек
+cd app && python3 guides.py     # состав подвкладок и подстановка портов из config
 ```
 
 Сами запросы к API Sonarr, Radarr и Prowlarr здесь не подделываются: разъедется
@@ -61,14 +62,14 @@ prepare_dirs          создать папки от имени пользова
                       linuxserver.io работают под PUID=1000 и иначе не запишут)
 ensure_cluster        pkexec env INSTALL_K3S_EXEC=... sh k3s-install.sh
 wait_for_node         kubectl wait --for=condition=Ready node --all
-create_secret         пароль качалки: генерация + PBKDF2, kubectl create secret
+create_secret         пароль торрента: генерация + PBKDF2, kubectl create secret
 apply_volumes         hostpath-volumes.yaml.tmpl с подставленными путями
 apply_stack           kubectl apply -k deploy/k3s
 apply_monitoring      профиль «полный»: kubectl apply -f k8s/monitoring
 apply_identity        PUID/PGID по os.getuid() того, кто запустил установщик
 wait_for_pods         kubectl wait --for=condition=Ready pod --all
 wire.configure        FlareSolverr в Prowlarr и метки на индексерах, папка для
-                      скачивания в качалке, качалка и корневые папки
+                      скачивания в торренте, торрент и корневые папки
                       в *arr, hardlink'и, Prowlarr → Sonarr/Radarr
 ```
 
@@ -115,13 +116,13 @@ PBKDF2 — способ однажды тихо разъехаться и пол
 карту inode и восстанавливает связи через `os.link`, а исходник удаляет только
 после полностью удавшегося копирования — не хватило места, всё возвращается назад.
 
-**Качалке отдельно говорят, куда складывать.** По умолчанию qBittorrent
+**Торренту отдельно говорят, куда складывать.** По умолчанию qBittorrent
 сохраняет в свой `/config/Downloads` — то есть на том с настройками, а не на том
 с медиатекой. Отказ от этого молчаливый и дорогой: том с настройками маленький,
 но хуже то, что жёсткая ссылка через границу томов невозможна, и \*arr на импорте
 делают копию. Каждый фильм занимает место дважды, ошибки при этом нет ни одной —
 а ведь ровно ради совпадения томов `downloads` и `library` и лежат рядом. Путь
-выставляет `wire.set_download_dir()` через API качалки (идемпотентно, чинит и уже
+выставляет `wire.set_download_dir()` через API торрента (идемпотентно, чинит и уже
 работающую установку) и засевает initContainer в манифесте — на свежей установке
 он верен с первой секунды. Совпадение обоих мест с `config.DOWNLOADS_DIR`
 сверяет CI. Найдено живым прогоном: Sonarr и Radarr сами сообщали об этом в

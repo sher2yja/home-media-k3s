@@ -49,6 +49,9 @@ jobs:
       - name: Самопроверка связывания сервисов
         run: cd app && python wire.py
 
+      - name: Самопроверка инструкций по сервисам
+        run: cd app && python guides.py
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'
@@ -186,10 +189,10 @@ jobs:
           print(f'PUID правится у {len(in_manifests)} развёртываний — как в манифестах')
           PY
 
-      # Тот же риск расхождения, третий раз: куда качалка складывает скачанное.
+      # Тот же риск расхождения, третий раз: куда торрент складывает скачанное.
       # /data/downloads обязан лежать на ОДНОМ томе с /data/library, иначе жёсткая
       # ссылка невозможна, *arr на импорте копируют, и каждый фильм занимает место
-      # дважды — молча. Путь живёт в двух местах: в засеваемом конфиге качалки и в
+      # дважды — молча. Путь живёт в двух местах: в засеваемом конфиге торрента и в
       # app/config.py. Разъедутся — сломается ровно то, ради чего тома общие.
       - name: Путь для скачивания в манифесте совпадает с app/config.py
         run: |
@@ -202,8 +205,8 @@ jobs:
               'k8s/media-stack/qbittorrent/deployment.yaml').read_text())
           seed = ' '.join(doc['spec']['template']['spec']['initContainers'][0]['command'])
           want = f'Session\\DefaultSavePath={config.DOWNLOADS_DIR}'
-          assert want in seed, f'в засеваемом конфиге качалки нет {want!r}'
-          print(f'качалка засевается с {want}')
+          assert want in seed, f'в засеваемом конфиге торрента нет {want!r}'
+          print(f'торрент засевается с {want}')
           PY
 
       # Головы у раннера нет, поэтому окно собирается в виртуальном X-сервере.
@@ -227,6 +230,18 @@ jobs:
               time.sleep(0.1)
 
           assert app.notebook.index('end') == 4, 'вкладок должно быть четыре'
+
+          # Подвкладка на каждый сервис плюс «Все сервисы». Разъезжается это
+          # молча: guides.ORDER задаёт состав, а окно строит подвкладки по нему,
+          # и сервис, добавленный в config без инструкции, тут и всплывёт.
+          import config, guides
+          names = [app.server_tabs.tab(i, 'text')
+                   for i in range(app.server_tabs.index('end'))]
+          assert names[0] == 'Все сервисы', names
+          assert names[1:] == [config.BY_KEY[k].title for k in guides.ORDER], names
+          for key, widget in app.guide_texts.items():
+              assert widget.get('1.0', 'end').strip(), f'{key}: инструкция пустая'
+          print('подвкладок', len(names), '—', ', '.join(names))
 
           def texts(w):
               for ch in w.winfo_children():
@@ -276,7 +291,7 @@ jobs:
           result = install.install('simple', home / 'hm-config', home / 'hm-media',
                                    on_line=print)
           assert result['ok'], 'установка вернула ok=False'
-          assert result['qbittorrent_password'], 'пароль качалки не создан'
+          assert result['qbittorrent_password'], 'пароль торрента не создан'
           PY
 
       # install.install() уже дождался связывания и упал бы, если бы его не было.
@@ -329,7 +344,7 @@ jobs:
           for svc, folder in config.ROOT_FOLDERS.items():
               key = media.arr_api_key(config_dir, svc)
               _, clients, _ = wire._api(svc, key, '/api/v3/downloadclient')
-              assert any(c['name'] == 'qBittorrent' for c in clients), f'{svc}: качалки нет'
+              assert any(c['name'] == 'qBittorrent' for c in clients), f'{svc}: торрента нет'
               _, roots, _ = wire._api(svc, key, '/api/v3/rootfolder')
               mine = [r for r in roots if r['path'].rstrip('/') == folder]
               assert mine, f'{svc}: нет {folder}'
@@ -338,7 +353,7 @@ jobs:
               assert mine[0].get('accessible'), f'{svc}: {folder} недоступна изнутри'
               _, mm, _ = wire._api(svc, key, '/api/v3/config/mediamanagement')
               assert mm['copyUsingHardlinks'], f'{svc}: hardlink не включён'
-              print(f'{svc}: качалка, папка {folder}, hardlink — на месте')
+              print(f'{svc}: торрент, папка {folder}, hardlink — на месте')
 
           prowlarr = media.arr_api_key(config_dir, 'prowlarr')
           _, apps, _ = wire._api('prowlarr', prowlarr, '/api/v1/applications')
@@ -350,7 +365,7 @@ jobs:
           wire.configure(config_dir)
           _, clients, _ = wire._api('sonarr', media.arr_api_key(config_dir, 'sonarr'),
                                     '/api/v3/downloadclient')
-          assert len(clients) == 1, f'качалка задвоилась: {len(clients)}'
+          assert len(clients) == 1, f'торрент задвоился: {len(clients)}'
           print('повторный вызов ничего не задвоил')
           PY
 

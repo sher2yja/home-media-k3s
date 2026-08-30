@@ -345,7 +345,7 @@ def create_qbittorrent_secret(on_line=None) -> str | None:
                 f"--from-literal=password-pbkdf2={qbittorrent_pbkdf2(password)}",
                 on_line=on_line, timeout=120)
     if r.returncode != 0:
-        raise RuntimeError("Не удалось создать пароль качалки: " + r.stdout[-2000:])
+        raise RuntimeError("Не удалось создать пароль торрента: " + r.stdout[-2000:])
     return password
 
 
