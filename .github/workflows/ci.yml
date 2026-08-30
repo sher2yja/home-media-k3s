@@ -129,6 +129,23 @@ jobs:
           print('порты k3s совпадают с app/config.py')
           PY
 
+      # e2e ставит k3s сам через curl, поэтому скачивание установщика ИЗ
+      # ПРИЛОЖЕНИЯ там не выполняется ни разу. Именно оно и сломалось: urllib
+      # представляется как Python-urllib, а CDN за get.k3s.io отвечает на это 403,
+      # и установка падала у каждого пользователя Linux на первом же шаге.
+      - name: Установщик k3s реально скачивается
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, 'app')
+          import install
+
+          data = install.fetch_installer()
+          assert data.startswith(b'#!/bin/sh'), f'это не скрипт: {data[:40]!r}'
+          assert b'INSTALL_K3S_EXEC' in data, 'в скрипте нет INSTALL_K3S_EXEC'
+          print(f'{install.K3S_INSTALL_URL} отдал {len(data)} байт скрипта')
+          PY
+
       # Тот же риск расхождения, что и с портами, только про права: install.py
       # правит PUID у поимённого списка развёртываний. Добавится седьмой сервис на
       # образе linuxserver.io — он молча останется с PUID=1000 из манифеста и не

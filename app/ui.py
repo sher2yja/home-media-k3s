@@ -47,6 +47,33 @@ def _app_icon() -> tk.PhotoImage:
     return image
 
 
+def _scrollable(parent: ttk.Frame) -> ttk.Frame:
+    """Область, которая не теряет содержимое на невысоком экране.
+
+    Tk не рисует то, что не поместилось: виджеты, спакованные последними,
+    просто исчезают. На вкладке «Установка» так пропадала кнопка «Установить» —
+    программа выглядела сломанной, и заметить это на своей машине нельзя,
+    там окно открывается целиком.
+    """
+    canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+    bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    inner = ttk.Frame(canvas, padding=PAD)
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=bar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    bar.pack(side="right", fill="y")
+
+    def _fit(_event=None) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        # Ширину тянем за холстом: иначе текст с wraplength считает перенос по
+        # своей ширине, а не по окну, и строки уезжают вправо.
+        canvas.itemconfigure(window, width=canvas.winfo_width())
+
+    inner.bind("<Configure>", _fit)
+    canvas.bind("<Configure>", _fit)
+    return inner
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__(className=WM_CLASS_NAME)
@@ -66,6 +93,12 @@ class App(tk.Tk):
         self._events: queue.Queue = queue.Queue()
         self._busy = False
         self._recheck_job: str | None = None
+
+        # Колесо привязываем один раз на всё окно: Tk не передаёт событие вверх
+        # по вложенности, и привязка к самой области не сработала бы над её
+        # содержимым — то есть почти нигде.
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(sequence, self._on_wheel)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
@@ -108,6 +141,21 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
         return True
 
+    def _on_wheel(self, event) -> None:
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            # У поля с текстом своя прокрутка — чужую поверх неё не крутим.
+            if isinstance(widget, (tk.Text, tk.Listbox)):
+                return
+            if isinstance(widget, tk.Canvas):
+                break
+            widget = widget.master
+        if widget is None:
+            return
+        # Linux шлёт колесо кнопками 4 и 5, Windows и macOS — величиной delta.
+        up = event.num == 4 if event.num in (4, 5) else event.delta > 0
+        widget.yview_scroll(-1 if up else 1, "units")
+
     def _drain(self) -> None:
         while True:
             try:
@@ -142,8 +190,9 @@ class App(tk.Tk):
     # --- Вкладка «Установка» ------------------------------------------------
 
     def _build_setup_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=PAD)
-        self.notebook.add(tab, text="Установка")
+        outer = ttk.Frame(self.notebook)
+        self.notebook.add(outer, text="Установка")
+        tab = _scrollable(outer)
 
         ttk.Label(tab, text="Установка домашнего медиасервера",
                   font=("TkDefaultFont", 14, "bold")).pack(anchor="w")

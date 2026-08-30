@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -175,6 +176,8 @@ def host_path(path: Path) -> str:
 # --- Подъём кластера --------------------------------------------------------
 
 K3S_INSTALL_URL = "https://get.k3s.io"
+# Чем программа представляется в сети. См. fetch_installer.
+USER_AGENT = "home-media-k3s (+https://github.com/sher2yja/home-media-k3s)"
 
 # Kubeconfig по умолчанию доступен только root. Приложение работает от обычного
 # пользователя, и без этого флага каждый вызов kubectl требовал бы повышения прав.
@@ -191,13 +194,33 @@ def k3s_installed() -> bool:
     return shutil.which("k3s") is not None
 
 
+def fetch_installer() -> bytes:
+    """Забирает скрипт установки k3s.
+
+    Заголовок User-Agent обязателен. По умолчанию urllib представляется как
+    `Python-urllib/3.12`, и CDN за get.k3s.io отвечает на это `403 Forbidden` —
+    установка падала у каждого пользователя Linux на первом же шаге, а в окне
+    было написано только «HTTP Error 403: Forbidden». Представляемся честно:
+    подделывать чужой User-Agent, чтобы обойти чужое правило, незачем — хватает
+    любого своего.
+    """
+    request = urllib.request.Request(K3S_INSTALL_URL, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=60) as r:
+        return r.read()
+
+
 def _download_installer() -> Path:
     """Скачиваем скрипт в файл, а не запускаем `curl | sh`. Разница не
     косметическая: скачанный файл можно показать человеку и он же остаётся на
     диске, если установка упала и нужно разбираться."""
     path = Path(tempfile.gettempdir()) / "k3s-install.sh"
-    with urllib.request.urlopen(K3S_INSTALL_URL, timeout=60) as r:
-        path.write_bytes(r.read())
+    try:
+        path.write_bytes(fetch_installer())
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Не удалось скачать установщик k3s с {K3S_INSTALL_URL}: {e}. "
+            f"Проверьте интернет и попробуйте ещё раз."
+        ) from e
     return path
 
 
