@@ -49,8 +49,30 @@ class Step:
 
 # --- Обёртки над API --------------------------------------------------------
 
+def _reason(raw: bytes) -> str:
+    """Достаёт из тела ответа причину, которую назвал сам сервис.
+
+    Sonarr и Radarr на отказ отвечают не пустой четырёхсоткой, а списком вида
+    [{"propertyName": "Path", "errorMessage": "Folder is not writable by user abc"}].
+    Без этой строки в окне остаётся "сервис ответил 400" — сообщение, по которому
+    нельзя ни понять причину, ни её починить. Права на папку выглядят именно так.
+    """
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw.decode("utf-8", "replace").strip()[:200]
+    items = payload if isinstance(payload, list) else [payload]
+    parts = [str(item.get("errorMessage") or item.get("message") or "").strip()
+             for item in items if isinstance(item, dict)]
+    return "; ".join(p for p in parts if p)[:200]
+
+
 def _api(key: str, api_key: str, path: str, *, data=None, method: str | None = None):
-    """Запрос к сервису снаружи, по NodePort: приложение живёт на хосте."""
+    """Запрос к сервису снаружи, по NodePort: приложение живёт на хосте.
+
+    Возвращает тройку (код, разобранный ответ, причина отказа). Причина пустая,
+    когда всё хорошо, и разбирается из тела, когда нет.
+    """
     url = f"{config.service_url(config.BY_KEY[key])}{path}"
     headers = {"X-Api-Key": api_key}
     body = None
@@ -59,11 +81,16 @@ def _api(key: str, api_key: str, path: str, *, data=None, method: str | None = N
         headers["Content-Type"] = "application/json"
     code, raw = media._request(url, headers=headers, data=body, method=method)
     if code not in (200, 201, 202):
-        return code, None
+        return code, None, _reason(raw)
     try:
-        return code, json.loads(raw) if raw else None
+        return code, json.loads(raw) if raw else None, ""
     except ValueError:
-        return code, None
+        return code, None, ""
+
+
+def _failed(title: str, code: int, reason: str) -> Step:
+    """Одинаковый текст отказа во всех шагах: код и то, что сказал сервис."""
+    return Step(title, False, f"сервис ответил {code}" + (f": {reason}" if reason else ""))
 
 
 def wait_for_api_key(config_dir: Path, service: str, timeout: int = 120) -> str | None:
@@ -85,7 +112,7 @@ def _schema_entry(key: str, api_key: str, path: str, implementation: str):
     полный список полей с их значениями по умолчанию, которые у разных версий
     разные. Нам остаётся заменить несколько значений.
     """
-    _, schema = _api(key, api_key, path)
+    _, schema, _ = _api(key, api_key, path)
     for entry in schema or []:
         if entry.get("implementation") == implementation:
             return entry
@@ -105,7 +132,7 @@ def _set_field(entry: dict, name: str, value) -> None:
 def add_download_client(key: str, api_key: str, password: str) -> Step:
     """Качалка в Sonarr или Radarr. Без неё они находят раздачу и не могут её взять."""
     title = f"Качалка в {config.BY_KEY[key].title}"
-    _, existing = _api(key, api_key, "/api/v3/downloadclient")
+    _, existing, _ = _api(key, api_key, "/api/v3/downloadclient")
     if any(c.get("name") == "qBittorrent" for c in existing or []):
         return Step(title, True, "уже прописана")
 
@@ -120,21 +147,21 @@ def add_download_client(key: str, api_key: str, password: str) -> Step:
     _set_field(entry, "port", qbt.internal_port)
     _set_field(entry, "username", "admin")
     _set_field(entry, "password", password)
-    code, _ = _api(key, api_key, "/api/v3/downloadclient", data=entry)
+    code, _, reason = _api(key, api_key, "/api/v3/downloadclient", data=entry)
     return (Step(title, True, "прописана") if code in (200, 201)
-            else Step(title, False, f"сервис ответил {code}"))
+            else _failed(title, code, reason))
 
 
 def add_root_folder(key: str, api_key: str) -> Step:
     """Корневая папка — куда раскладывать разобранное."""
     path = config.ROOT_FOLDERS[key]
     title = f"Папка для готового в {config.BY_KEY[key].title}"
-    _, existing = _api(key, api_key, "/api/v3/rootfolder")
+    _, existing, _ = _api(key, api_key, "/api/v3/rootfolder")
     if any(f.get("path", "").rstrip("/") == path for f in existing or []):
         return Step(title, True, f"уже задана: {path}")
-    code, _ = _api(key, api_key, "/api/v3/rootfolder", data={"path": path})
+    code, _, reason = _api(key, api_key, "/api/v3/rootfolder", data={"path": path})
     return (Step(title, True, path) if code in (200, 201)
-            else Step(title, False, f"сервис ответил {code}"))
+            else _failed(title, code, reason))
 
 
 def enable_hardlinks(key: str, api_key: str) -> Step:
@@ -145,16 +172,17 @@ def enable_hardlinks(key: str, api_key: str) -> Step:
     поместится на диск, и человек не поймёт почему.
     """
     title = f"Экономия места в {config.BY_KEY[key].title}"
-    code, cfg = _api(key, api_key, "/api/v3/config/mediamanagement")
+    code, cfg, _ = _api(key, api_key, "/api/v3/config/mediamanagement")
     if not cfg:
         return Step(title, False, f"настройки не прочитались ({code})")
     if cfg.get("copyUsingHardlinks"):
         return Step(title, True, "уже включена")
     cfg["copyUsingHardlinks"] = True
-    code, _ = _api(key, api_key, f"/api/v3/config/mediamanagement/{cfg['id']}",
-                   data=cfg, method="PUT")
+    code, _, reason = _api(key, api_key,
+                               f"/api/v3/config/mediamanagement/{cfg['id']}",
+                               data=cfg, method="PUT")
     return (Step(title, True, "включена: фильм не занимает место дважды")
-            if code in (200, 202) else Step(title, False, f"сервис ответил {code}"))
+            if code in (200, 202) else _failed(title, code, reason))
 
 
 def link_prowlarr(prowlarr_key: str, key: str, api_key: str) -> Step:
@@ -165,7 +193,7 @@ def link_prowlarr(prowlarr_key: str, key: str, api_key: str) -> Step:
     """
     service = config.BY_KEY[key]
     title = f"Поиск для {service.title}"
-    _, existing = _api("prowlarr", prowlarr_key, "/api/v1/applications")
+    _, existing, _ = _api("prowlarr", prowlarr_key, "/api/v1/applications")
     if any(a.get("name", "").lower() == key for a in existing or []):
         return Step(title, True, "уже связан")
 
@@ -180,9 +208,10 @@ def link_prowlarr(prowlarr_key: str, key: str, api_key: str) -> Step:
     _set_field(entry, "baseUrl", config.internal_url(key))
     _set_field(entry, "apiKey", api_key)
     _set_field(entry, "syncCategories", SYNC_CATEGORIES[key])
-    code, _ = _api("prowlarr", prowlarr_key, "/api/v1/applications", data=entry)
+    code, _, reason = _api("prowlarr", prowlarr_key, "/api/v1/applications",
+                               data=entry)
     return (Step(title, True, "связан") if code in (200, 201)
-            else Step(title, False, f"Prowlarr ответил {code}"))
+            else _failed(title, code, reason))
 
 
 # --- Всё вместе -------------------------------------------------------------

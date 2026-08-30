@@ -129,6 +129,29 @@ jobs:
           print('порты k3s совпадают с app/config.py')
           PY
 
+      # Тот же риск расхождения, что и с портами, только про права: install.py
+      # правит PUID у поимённого списка развёртываний. Добавится седьмой сервис на
+      # образе linuxserver.io — он молча останется с PUID=1000 из манифеста и не
+      # сможет писать в папку человека. Пусть лучше упадёт здесь.
+      - name: Список развёртываний с PUID совпадает с манифестами
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+          sys.path.insert(0, 'app')
+          import install
+
+          in_manifests = set()
+          for path in pathlib.Path('k8s/media-stack').glob('*/deployment.yaml'):
+              doc = yaml.safe_load(path.read_text(encoding='utf-8'))
+              env = doc['spec']['template']['spec']['containers'][0].get('env') or []
+              if any(v['name'] == 'PUID' for v in env):
+                  in_manifests.add(doc['metadata']['name'])
+          assert in_manifests == set(install.LSIO_DEPLOYMENTS), (
+              f'разошлось: манифесты {sorted(in_manifests)}, '
+              f'install.py {sorted(install.LSIO_DEPLOYMENTS)}')
+          print(f'PUID правится у {len(in_manifests)} развёртываний — как в манифестах')
+          PY
+
       # Головы у раннера нет, поэтому окно собирается в виртуальном X-сервере.
       # Одной проверки «окно построилось» мало: она пропускает целый класс
       # ошибок — обращение к Tk из фонового потока. Поэтому цикл крутится, пока
@@ -251,27 +274,44 @@ jobs:
           # Проверяем не свой возврат, а состояние сервисов: спрашиваем у них.
           for svc, folder in config.ROOT_FOLDERS.items():
               key = media.arr_api_key(config_dir, svc)
-              _, clients = wire._api(svc, key, '/api/v3/downloadclient')
+              _, clients, _ = wire._api(svc, key, '/api/v3/downloadclient')
               assert any(c['name'] == 'qBittorrent' for c in clients), f'{svc}: качалки нет'
-              _, roots = wire._api(svc, key, '/api/v3/rootfolder')
-              assert any(r['path'].rstrip('/') == folder for r in roots), f'{svc}: нет {folder}'
-              _, mm = wire._api(svc, key, '/api/v3/config/mediamanagement')
+              _, roots, _ = wire._api(svc, key, '/api/v3/rootfolder')
+              mine = [r for r in roots if r['path'].rstrip('/') == folder]
+              assert mine, f'{svc}: нет {folder}'
+              # accessible — ответ самого сервиса на вопрос «я туда могу писать?».
+              # Именно он и был False, когда PUID не совпадал с хозяином папки.
+              assert mine[0].get('accessible'), f'{svc}: {folder} недоступна изнутри'
+              _, mm, _ = wire._api(svc, key, '/api/v3/config/mediamanagement')
               assert mm['copyUsingHardlinks'], f'{svc}: hardlink не включён'
               print(f'{svc}: качалка, папка {folder}, hardlink — на месте')
 
           prowlarr = media.arr_api_key(config_dir, 'prowlarr')
-          _, apps = wire._api('prowlarr', prowlarr, '/api/v1/applications')
+          _, apps, _ = wire._api('prowlarr', prowlarr, '/api/v1/applications')
           names = {a['name'] for a in apps or []}
           assert {'sonarr', 'radarr'} <= names, f'Prowlarr знает только про {names}'
           print('Prowlarr связан с Sonarr и Radarr')
 
           # Повторный вызов не должен ничего задвоить: кнопку нажмут дважды.
           wire.configure(config_dir)
-          _, clients = wire._api('sonarr', media.arr_api_key(config_dir, 'sonarr'),
-                                 '/api/v3/downloadclient')
+          _, clients, _ = wire._api('sonarr', media.arr_api_key(config_dir, 'sonarr'),
+                                    '/api/v3/downloadclient')
           assert len(clients) == 1, f'качалка задвоилась: {len(clients)}'
           print('повторный вызов ничего не задвоил')
           PY
+
+      # Права на папку — то, из-за чего связывание падало с 400 без объяснения.
+      # Раннер работает под uid 1001, в манифестах стоит 1000, и без apply_identity
+      # контейнер не может писать в папку человека. Спрашиваем у самого сервиса.
+      - name: PUID подставлен по хозяину папок
+        run: |
+          echo "uid раннера: $(id -u), gid: $(id -g)"
+          for d in jellyfin prowlarr qbittorrent radarr sonarr; do
+            sudo k3s kubectl get deployment "$d" -n media \
+              -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="PUID")].value}{"\n"}' \
+              | grep -qx "$(id -u)" || { echo "PUID у $d не совпал с раннером"; exit 1; }
+          done
+          echo "все пять развёртываний пишут от имени $(id -u)"
 
       - name: Что было в логах, если упало
         if: failure()

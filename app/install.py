@@ -706,6 +706,7 @@ def migrate(new_config_dir: Path, new_media_dir: Path, on_line=None) -> dict:
     apply_volumes(new_config_dir, new_media_dir, on_line)
     result = apply_stack(on_line)
     if result.returncode == 0:
+        apply_identity(on_line)
         wait_for_volumes(on_line=on_line)
     return {"ok": result.returncode == 0, "needed": True, "bytes": plan["bytes"],
             "instant": plan["instant"],
@@ -737,6 +738,60 @@ def apply_stack(on_line=None) -> subprocess.CompletedProcess:
     return kubectl("apply", "-k", host_path(overlay_dir()), on_line=on_line)
 
 
+# Развёртывания на образах linuxserver.io: они и только они читают PUID/PGID.
+# Jellyseerr сюда не входит — образ не от linuxserver.io и этих переменных не знает.
+# Список сверяется с манифестами в CI: разъедется — упадёт проверка, а не установка.
+LSIO_DEPLOYMENTS = ("jellyfin", "prowlarr", "qbittorrent", "radarr", "sonarr")
+
+
+def container_identity() -> tuple[str, str]:
+    """Под каким пользователем контейнеры должны писать в папки человека.
+
+    В манифестах стенда стоит 1000 — владелец домашней папки на типовой рабочей
+    машине. Но папки создаёт установщик от имени того, кто его запустил, и если
+    его uid не 1000 (второй аккаунт на машине, раннер CI), контейнеры в них писать
+    не смогут. Сообщения об этом человек не увидит: подъедут они нормально, а
+    отказ придёт позже и в чужом интерфейсе — Sonarr отвечает 400 на добавление
+    корневой папки, не называя причиной права.
+
+    На Windows остаётся 1000: диски видны изнутри WSL2 как DrvFs, права там
+    синтетические (всё 0777), и настоящий uid значения не имеет.
+    """
+    if config.is_windows():
+        return "1000", "1000"
+    return str(os.getuid()), str(os.getgid())
+
+
+def apply_identity(on_line=None) -> subprocess.CompletedProcess:
+    """Проставляет PUID/PGID по тому, кто запустил установщик.
+
+    Отдельным шагом после apply, а не патчем kustomize: значение известно только
+    в момент установки, а патч пришлось бы писать в каталог оверлея — внутри
+    собранного бандла он одноразовый, а в репозитории это была бы правка исходников.
+    """
+    uid, gid = container_identity()
+    if on_line:
+        on_line(f"Контейнеры будут писать от имени {uid}:{gid}")
+    targets = [f"deployment/{name}" for name in LSIO_DEPLOYMENTS]
+    return kubectl("set", "env", "-n", "media", *targets,
+                   f"PUID={uid}", f"PGID={gid}", on_line=on_line)
+
+
+def wait_for_pods(timeout: int = 900, on_line=None) -> subprocess.CompletedProcess:
+    """Ждёт, пока сервисы поднимутся.
+
+    Между apply и первым ответом Sonarr лежит скачивание шести образов — около
+    трёх гигабайт, на домашнем канале это минуты. Без этого ожидания связывание
+    начиналось бы по несуществующим ещё сервисам и падало бы каждый первый раз
+    на свежей машине. Возврата не проверяем: не дождались — связывание скажет об
+    этом само, и кнопка «Связать сервисы» повторит.
+    """
+    if on_line:
+        on_line("Жду, пока сервисы поднимутся (первый раз это дольше всего)")
+    return kubectl("wait", "--for=condition=Ready", "pod", "--all", "-n", "media",
+                   f"--timeout={timeout}s", on_line=on_line, timeout=timeout + 60)
+
+
 def apply_monitoring(on_line=None) -> subprocess.CompletedProcess:
     # Каталогом, а не по файлам: числовой префикс задаёт порядок, а apply -f по
     # каталогу применяет их в алфавитном порядке — namespace 00 идёт первым.
@@ -766,6 +821,7 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
     apply_volumes(config_dir, media_dir, on_line)
     result = apply_stack(on_line)
     if result.returncode == 0:
+        apply_identity(on_line)
         # Заявки создаёт apply_stack, поэтому ждать связывания можно только здесь.
         wait_for_volumes(on_line=on_line)
         if config.PROFILE_BY_KEY[profile_key].with_monitoring:
@@ -781,6 +837,7 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
     # объявлять установку неудачной, кнопка «Связать сервисы» повторит.
     steps = []
     if result.returncode == 0:
+        wait_for_pods(on_line=on_line)
         if on_line:
             on_line("Связываю сервисы между собой")
         steps = wire.configure(config_dir, on_line=on_line)
