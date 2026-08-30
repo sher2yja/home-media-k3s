@@ -78,6 +78,35 @@ jobs:
           print('старых слов нет, логин нигде не захардкожен')
           PY
 
+      # Дефект был реальным и ловился только руками: человек переключил профиль на
+      # простой, а на вопрос «удалить графики?» ответил «оставить». Grafana
+      # работает, в состоянии её нет — и предпроверка звала остановить
+      # «постороннюю программу» на 30030, показывая на его же Grafana.
+      - name: Работающая Grafana не считается чужой программой
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, 'app')
+          import config, install, media
+          # Все порты заняты, все сервисы отвечают — как на живой установке.
+          media.service_status = lambda host='localhost': [
+              {'key': s.key, 'alive': True} for s in config.SERVICES]
+          media.service_alive = lambda s, host='localhost': True
+          install._port_busy = lambda port: True
+
+          install.monitoring_installed = lambda: True
+          c = install._ports_check()
+          assert c.ok, f'своя Grafana объявлена чужой: {c.detail}'
+          print('мониторинг стоит -> порт свой:', c.detail)
+
+          # Обратная сторона: мониторинга нет, а порт занят — это снова чужое,
+          # и молчать об этом нельзя.
+          install.monitoring_installed = lambda: False
+          c = install._ports_check()
+          assert not c.ok and 'Grafana' in c.detail, f'чужой порт пропущен: {c.detail}'
+          print('мониторинга нет  -> порт чужой:', c.detail)
+          PY
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'
@@ -354,8 +383,12 @@ jobs:
       # некому нажать «разрешить». Всё остальное дальше делает сам установщик.
       - name: Поставить k3s
         run: |
-          curl -sfL https://get.k3s.io | \
-            sudo INSTALL_K3S_EXEC="--write-kubeconfig-mode 0644" sh -
+          # Флаги берём из app/install.py, а не повторяем строкой: разъехавшись,
+          # e2e поднимал бы не тот кластер, что у пользователя, и --disable=traefik
+          # не проверялся бы вовсе.
+          EXEC=$(python -c "import sys; sys.path.insert(0,'app'); import install; print(install.K3S_EXEC)")
+          echo "INSTALL_K3S_EXEC=$EXEC"
+          curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC="$EXEC" sh -
 
       - name: Установка тем же кодом, что у пользователя
         run: |
@@ -408,6 +441,27 @@ jobs:
       # по-настоящему: подделывать их ответы бессмысленно — разъедется как раз то,
       # что подделано. install.install() уже вызвал wire.configure(); здесь
       # проверяем, что связки действительно легли в конфиги сервисов.
+      # Traefik не обслуживает в этом проекте ничего (Ingress'ов нет вовсе), но
+      # забирает два СЛУЧАЙНЫХ NodePort'а из того же диапазона, где стоят наши
+      # фиксированные. Однажды он занял 30300 у Grafana, и полный профиль молча
+      # обрывался. Проверяем не только его отсутствие, но и число портов: чужих
+      # среди них быть не должно ни одного.
+      - name: Traefik не поднялся и портов не занял
+        run: |
+          if sudo k3s kubectl get pods -n kube-system -o name | grep -q traefik; then
+            sudo k3s kubectl get pods -n kube-system
+            echo 'Traefik всё-таки развернулся — флаг --disable=traefik не доехал'
+            exit 1
+          fi
+          ports=$(sudo k3s kubectl get svc -A \
+            -o jsonpath='{range .items[*].spec.ports[*]}{.nodePort}{"\n"}{end}' | grep -c .)
+          if [ "$ports" -ne 6 ]; then
+            sudo k3s kubectl get svc -A
+            echo "NodePort'ов $ports, а у простого профиля их ровно 6"
+            exit 1
+          fi
+          echo "Traefik не поднялся, NodePort'ов ровно 6 — все наши"
+
       - name: Сервисы связаны между собой
         run: |
           python - <<'PY'

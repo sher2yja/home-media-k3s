@@ -71,6 +71,18 @@ def jellyseerr_api_key(config_dir: Path) -> str | None:
 
 # --- Живы ли сервисы --------------------------------------------------------
 
+# 401/403 значит «отвечает, но требует входа» — сервис жив, это не поломка.
+_ALIVE = (200, 204, 301, 302, 401, 403)
+
+
+def service_alive(service, host: str = "localhost") -> bool:
+    """Отвечает ли конкретный сервис. Отдельно от service_status, потому что
+    предпроверка портов спрашивает про Grafana поимённо: в список сервисов та
+    попадает по профилю из состояния, а порт занимает по факту работы."""
+    code, _ = _request(f"http://{host}:{service.port}{service.health_path}")
+    return code in _ALIVE
+
+
 def service_status(host: str = "localhost") -> list[dict]:
     """Статус для показа человеку. Намеренно не «pod Running» и не код ответа:
     вопрос, на который отвечает эта страница, — «работает или нет»."""
@@ -81,9 +93,7 @@ def service_status(host: str = "localhost") -> list[dict]:
             config.PROFILE_BY_KEY[state["profile"]].with_monitoring:
         services.append(config.GRAFANA)
     for s in services:
-        code, _ = _request(f"http://{host}:{s.port}{s.health_path}")
-        # 401/403 значит «отвечает, но требует входа» — сервис жив, это не поломка.
-        alive = code in (200, 204, 301, 302, 401, 403)
+        alive = service_alive(s, host)
         out.append({
             "key": s.key,
             "title": s.title,
