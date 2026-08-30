@@ -31,13 +31,20 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /app/config
+          # Памяти больше, чем у соседей, по измеренной причине: сразу после
+          # запуска Jellyseerr занимает 197Mi настоящей памяти при прежнем
+          # пределе 256Mi. Оставшегося не хватает на то, что растёт от
+          # пользования: ответы TMDB он держит В ПАМЯТИ с сроком 12 часов
+          # (externalapi.js, node-cache), то есть чем больше человек листает,
+          # тем ближе предел. 128Mi в запросе занижали и без того: столько он
+          # не занимает никогда.
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
       volumes:
         - name: config
           persistentVolumeClaim:

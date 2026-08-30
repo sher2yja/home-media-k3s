@@ -361,7 +361,7 @@ jobs:
       - name: Обход Cloudflare чинится сам
         run: |
           python - <<'PY'
-          import pathlib, sys
+          import json, pathlib, sys, urllib.request
           sys.path.insert(0, 'app')
           import config, media, wire
 
@@ -392,7 +392,18 @@ jobs:
           # Torznab с недоступным адресом заводится мгновенно и в сеть не ходит:
           # проверяем метку, а не работу трекера.
           _, profiles, _ = wire._api('prowlarr', key, '/api/v1/appprofile')
-          _, schema, _ = wire._api('prowlarr', key, '/api/v1/indexer/schema')
+          assert profiles, 'Prowlarr не отдал профили приложений'
+
+          # Схему тянем в обход wire._api: она весит 5.7 МБ и приходит за пять
+          # секунд, ровно в media.TIMEOUT. Приложению столько ждать незачем и
+          # оно этот запрос не делает — а проверке нужен запас, иначе она падает
+          # не на том, что проверяет.
+          url = (config.service_url(config.BY_KEY['prowlarr'])
+                 + '/api/v1/indexer/schema')
+          request = urllib.request.Request(url, headers={'X-Api-Key': key})
+          with urllib.request.urlopen(request, timeout=120) as answer:
+              schema = json.load(answer)
+          assert schema, 'Prowlarr не отдал схему индексеров'
           entry = [s for s in schema if s['implementation'] == 'Torznab'][0]
           entry.update(name='проба-меток', enable=False, tags=[],
                        appProfileId=profiles[0]['id'])
