@@ -52,6 +52,32 @@ jobs:
       - name: Самопроверка инструкций по сервисам
         run: cd app && python guides.py
 
+      # Оба слова уже возвращались после переименования: «качалку» пропустили в
+      # одном заголовке справки, а «Логин admin» пережил появление своего логина
+      # и врал каждому, кто его сменил. Оба раза находил это пользователь.
+      - name: Слова, которые не должны вернуться
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          # «качалка» — старое название торрента. docs/ не под git, раннбуки с
+          # дословным выводом прошлых прогонов сюда не попадают и не правятся.
+          for f in [*pathlib.Path('app').rglob('*.py'), *pathlib.Path('.').glob('*.md')]:
+              for n, line in enumerate(f.read_text().splitlines(), 1):
+                  if re.search('качалк', line, re.I):
+                      bad.append(f'{f}:{n}: качалка вместо торрента')
+          # Логин задаётся пользователем — на экране он обязан браться из
+          # config.qbittorrent_login(), а не стоять текстом.
+          for f in (pathlib.Path('app/ui.py'), pathlib.Path('app/guides.py')):
+              for n, line in enumerate(f.read_text().splitlines(), 1):
+                  if 'admin' in line:
+                      bad.append(f'{f}:{n}: логин admin захардкожен')
+          if bad:
+              print('\n'.join(bad), file=sys.stderr)
+              sys.exit(1)
+          print('старых слов нет, логин нигде не захардкожен')
+          PY
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'

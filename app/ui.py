@@ -477,7 +477,7 @@ class App(tk.Tk):
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, wraplength=460, text=(
             "Пароль понадобится, только если вы полезете в настройки торрента. "
-            "Логин admin, пароль:")).pack(anchor="w")
+            f"Логин {config.qbittorrent_login()}, пароль:")).pack(anchor="w")
         entry = ttk.Entry(frame, width=30, font=("TkFixedFont", 12))
         entry.insert(0, password)
         entry.configure(state="readonly")
@@ -808,16 +808,6 @@ class App(tk.Tk):
         password = state.get("qbittorrent_password")
         profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
         blocks = [
-            "НАСТРОЙКА СЕРВЕРОВ ПЕРЕЕХАЛА",
-            ("Пошаговые инструкции — что нажать в Jellyfin, Prowlarr и "
-             "Jellyseerr — теперь на вкладке «Настройки сервера», по подвкладке "
-             "на каждый сервис. Там же видно, какие сервисы настраивать не "
-             "нужно вовсе."),
-            "",
-            "Здесь осталось то, чем пользуются каждый день.",
-            "",
-            "=" * 60,
-            "",
             "ПОСМОТРЕТЬ ФИЛЬМ",
             "1. Откройте Jellyfin на вкладке «Настройки сервера».",
             "2. Выберите фильм и нажмите «Смотреть».",
@@ -835,8 +825,8 @@ class App(tk.Tk):
             "",
         ]
         if password:
-            blocks += ["ПАРОЛЬ КАЧАЛКИ",
-                       f"Логин admin, пароль {password}.",
+            blocks += ["ПАРОЛЬ ТОРРЕНТА",
+                       f"Логин {config.qbittorrent_login()}, пароль {password}.",
                        ("Программа уже вписала его куда надо. Он нужен, только "
                         "если вы полезете в настройки qBittorrent сами."), ""]
         if profile and profile.with_monitoring:
