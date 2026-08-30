@@ -156,6 +156,22 @@ def add_download_client(key: str, api_key: str, password: str) -> Step:
             else _failed(title, code, reason))
 
 
+# Метка, которой помечается прокси. Без неё Prowlarr его просто не применяет —
+# см. add_flaresolverr, там же измерения.
+FLARESOLVERR_TAG = "flaresolverr"
+
+
+def _ensure_tag(prowlarr_key: str, label: str) -> int | None:
+    """Возвращает id метки, заводя её при необходимости."""
+    _, tags, _ = _api("prowlarr", prowlarr_key, "/api/v1/tag")
+    for tag in tags or []:
+        if tag.get("label") == label:
+            return tag["id"]
+    code, created, _ = _api("prowlarr", prowlarr_key, "/api/v1/tag",
+                            data={"label": label})
+    return created.get("id") if code in (200, 201) and created else None
+
+
 def add_flaresolverr(prowlarr_key: str) -> Step:
     """Учит Prowlarr проходить проверку Cloudflare.
 
@@ -165,15 +181,33 @@ def add_flaresolverr(prowlarr_key: str) -> Step:
     адресе — Cloudflare отдаёт страницу с задачей на JavaScript, а Prowlarr
     браузером не является. FlareSolverr эту задачу решает и отдаёт куки.
 
-    Тег не назначаем намеренно. В Prowlarr прокси без тегов применяется ко ВСЕМ
-    индексерам, а с тегом — только к помеченным им вручную. Второе означало бы,
-    что человек добавляет сайт, получает 403 и должен сам догадаться сходить в
-    настройки и поставить тег. Ровно этого приложение и старается не допускать.
+    МЕТКА ОБЯЗАТЕЛЬНА, и это проверено измерением, а не взято из документации.
+    Прокси без меток Prowlarr не применяет ВООБЩЕ: тот же запрос уходит напрямую
+    и получает 403 за две секунды. С меткой он идёт через FlareSolverr и доходит
+    до формы входа за тридцать. Переключается в обе стороны, проверено дважды.
+    Сам индексер при этом помечать не нужно — хватает метки на прокси, и это
+    важно: человек добавляет сайт обычным образом, ни о чём не зная.
     """
     title = "Обход проверки «вы не робот»"
+    tag_id = _ensure_tag(prowlarr_key, FLARESOLVERR_TAG)
+    if tag_id is None:
+        return Step(title, False, "Prowlarr не дал завести метку")
+
     _, existing, _ = _api("prowlarr", prowlarr_key, "/api/v1/indexerproxy")
-    if any(p.get("implementation") == "FlareSolverr" for p in existing or []):
-        return Step(title, True, "уже настроен")
+    current = next((p for p in existing or []
+                    if p.get("implementation") == "FlareSolverr"), None)
+    if current:
+        if current.get("tags"):
+            return Step(title, True, "уже настроен")
+        # Прокси есть, но без метки — значит он не работает, хотя выглядит
+        # настроенным. Чиним молча: это ровно тот случай, ради которого кнопка
+        # «Связать сервисы» и существует.
+        current["tags"] = [tag_id]
+        code, _, reason = _api("prowlarr", prowlarr_key,
+                               f"/api/v1/indexerproxy/{current['id']}",
+                               data=current, method="PUT")
+        return (Step(title, True, "починен: без метки он не применялся")
+                if code in (200, 201, 202) else _failed(title, code, reason))
 
     entry = _schema_entry("prowlarr", prowlarr_key, "/api/v1/indexerproxy/schema",
                           "FlareSolverr")
@@ -181,7 +215,7 @@ def add_flaresolverr(prowlarr_key: str) -> Step:
         return Step(title, False, "Prowlarr не предложил настроек для FlareSolverr")
 
     entry["name"] = "FlareSolverr"
-    entry["tags"] = []          # пусто = для всех индексеров, см. docstring
+    entry["tags"] = [tag_id]
     _set_field(entry, "host", config.FLARESOLVERR_URL)
     code, _, reason = _api("prowlarr", prowlarr_key, "/api/v1/indexerproxy", data=entry)
     return (Step(title, True, "настроен: сайты за Cloudflare теперь доступны")
