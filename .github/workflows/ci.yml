@@ -172,9 +172,11 @@ jobs:
           assert result['qbittorrent_password'], 'пароль качалки не создан'
           PY
 
+      # install.install() уже дождался связывания и упал бы, если бы его не было.
+      # Здесь только показываем результат: какая заявка на каком томе оказалась.
       - name: Тома связались с заявками
         run: |
-          sudo k3s kubectl get pvc -n media
+          sudo k3s kubectl get pvc,pv -n media
           test "$(sudo k3s kubectl get pvc -n media -o jsonpath='{.items[*].status.phase}' | tr ' ' '\n' | grep -c Bound)" -eq 7
 
       - name: Поды поднялись

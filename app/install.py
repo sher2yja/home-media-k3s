@@ -398,6 +398,25 @@ def create_qbittorrent_secret(on_line=None) -> str | None:
 
 # --- Установка целиком ------------------------------------------------------
 
+def wait_for_volumes(timeout: int = 180, on_line=None) -> None:
+    """Ждём, пока заявки свяжутся с подготовленными томами.
+
+    Без этого ожидания несвязанный том — молчаливый отказ: установка отвечает
+    «готово», поды остаются Pending, а человек видит шесть крестиков и кнопку
+    «починить», которая ничего не меняет. Связывание — операция контроллера, оно
+    не мгновенное, поэтому именно ждём, а не проверяем сразу после apply.
+    """
+    if on_line:
+        on_line("Жду, пока тома свяжутся с заявками")
+    r = kubectl("wait", "--for=jsonpath={.status.phase}=Bound", "pvc", "--all",
+                "-n", "media", f"--timeout={timeout}s", on_line=on_line,
+                timeout=timeout + 60)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "Тома не связались с заявками. Обычно это значит, что выбранная папка "
+            "недоступна кластеру. Подробности:\n" + r.stdout[-2000:])
+
+
 def apply_stack(on_line=None) -> subprocess.CompletedProcess:
     return kubectl("apply", "-k", host_path(overlay_dir()), on_line=on_line)
 
@@ -425,8 +444,11 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
     password = create_qbittorrent_secret(on_line)
     apply_volumes(config_dir, media_dir, on_line)
     result = apply_stack(on_line)
-    if result.returncode == 0 and config.PROFILE_BY_KEY[profile_key].with_monitoring:
-        result = apply_monitoring(on_line)
+    if result.returncode == 0:
+        # Заявки создаёт apply_stack, поэтому ждать связывания можно только здесь.
+        wait_for_volumes(on_line=on_line)
+        if config.PROFILE_BY_KEY[profile_key].with_monitoring:
+            result = apply_monitoring(on_line)
 
     # Пароль пишем только когда он только что родился: при повторной установке
     # create_qbittorrent_secret вернёт None, и затирать сохранённый было бы потерей.
@@ -450,8 +472,10 @@ def repair(on_line=None) -> dict:
     prepare_dirs(config_dir, media_dir)
     apply_volumes(config_dir, media_dir, on_line)
     result = apply_stack(on_line)
-    if result.returncode == 0 and config.PROFILE_BY_KEY[profile_key].with_monitoring:
-        result = apply_monitoring(on_line)
+    if result.returncode == 0:
+        wait_for_volumes(on_line=on_line)
+        if config.PROFILE_BY_KEY[profile_key].with_monitoring:
+            result = apply_monitoring(on_line)
     return {"ok": result.returncode == 0, "stdout": result.stdout, "stderr": "",
             "qbittorrent_password": None, "repair": True}
 
