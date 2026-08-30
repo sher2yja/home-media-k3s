@@ -23,8 +23,12 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import config
@@ -152,6 +156,54 @@ def add_download_client(key: str, api_key: str, password: str) -> Step:
             else _failed(title, code, reason))
 
 
+def set_download_dir(password: str) -> Step:
+    """Говорит качалке, куда складывать скачанное.
+
+    Сама она этого не знает: по умолчанию qBittorrent сохраняет в свой
+    /config/Downloads — то есть на том с настройками, а не на том с медиатекой.
+    Последствия молчаливые и дорогие. Том с настройками маленький, но хуже
+    другое: жёсткая ссылка через границу томов невозможна, и *arr на импорте
+    делают копию вместо неё. Каждый фильм занимает место дважды, ошибки при этом
+    нет ни одной. Ровно ради совпадения томов downloads и library и лежат рядом.
+
+    Ходим сюда своим клиентом, а не через _api: у качалки не ключ в заголовке, а
+    сессия с кукой, и общий помощник для *arr сюда не подходит.
+    """
+    title = "Папка для скачивания в качалке"
+    base = config.service_url(config.BY_KEY["qbittorrent"])
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    def post(path: str, fields: dict):
+        return opener.open(urllib.request.Request(
+            f"{base}{path}", data=urllib.parse.urlencode(fields).encode(),
+            headers={"Referer": base}), timeout=media.TIMEOUT)
+
+    def preferences() -> dict:
+        return json.loads(opener.open(f"{base}/api/v2/app/preferences",
+                                      timeout=media.TIMEOUT).read())
+
+    try:
+        post("/api/v2/auth/login", {"username": "admin", "password": password})
+        # Признак удачного входа — кука QBT_SID, а не тело ответа: qBittorrent
+        # 5.2+ отвечает на успех 204 No Content, и проверка по телу даёт ложный
+        # провал на верном пароле.
+        if not any(c.name.startswith("QBT_SID") for c in jar):
+            return Step(title, False, "качалка не приняла пароль")
+        if preferences().get("save_path", "").rstrip("/") == config.DOWNLOADS_DIR:
+            return Step(title, True, f"уже {config.DOWNLOADS_DIR}")
+        post("/api/v2/app/setPreferences",
+             {"json": json.dumps({"save_path": config.DOWNLOADS_DIR})})
+        # Проверяем не код ответа на запись, а то, что качалка теперь говорит сама.
+        saved = preferences().get("save_path", "").rstrip("/")
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        return Step(title, False, f"качалка не ответила: {error}")
+    if saved != config.DOWNLOADS_DIR:
+        return Step(title, False, f"осталась {saved!r}")
+    return Step(title, True, f"{config.DOWNLOADS_DIR} — на одном томе с библиотекой, "
+                             f"иначе фильм занял бы место дважды")
+
+
 def add_root_folder(key: str, api_key: str) -> Step:
     """Корневая папка — куда раскладывать разобранное."""
     path = config.ROOT_FOLDERS[key]
@@ -242,6 +294,10 @@ def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
             log(Step(f"Доступ к {config.BY_KEY[service].title}", False,
                      "сервис ещё не создал свой ключ — подождите пару минут "
                      "и нажмите кнопку снова"))
+
+    # Куда качать — настройка одна на всю качалку, поэтому до цикла по сервисам.
+    if password:
+        log(set_download_dir(password))
 
     for service in ("sonarr", "radarr"):
         if not keys.get(service):

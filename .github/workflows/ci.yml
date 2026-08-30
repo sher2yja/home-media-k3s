@@ -169,6 +169,26 @@ jobs:
           print(f'PUID правится у {len(in_manifests)} развёртываний — как в манифестах')
           PY
 
+      # Тот же риск расхождения, третий раз: куда качалка складывает скачанное.
+      # /data/downloads обязан лежать на ОДНОМ томе с /data/library, иначе жёсткая
+      # ссылка невозможна, *arr на импорте копируют, и каждый фильм занимает место
+      # дважды — молча. Путь живёт в двух местах: в засеваемом конфиге качалки и в
+      # app/config.py. Разъедутся — сломается ровно то, ради чего тома общие.
+      - name: Путь для скачивания в манифесте совпадает с app/config.py
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+          sys.path.insert(0, 'app')
+          import config
+
+          doc = yaml.safe_load(pathlib.Path(
+              'k8s/media-stack/qbittorrent/deployment.yaml').read_text())
+          seed = ' '.join(doc['spec']['template']['spec']['initContainers'][0]['command'])
+          want = f'Session\\DefaultSavePath={config.DOWNLOADS_DIR}'
+          assert want in seed, f'в засеваемом конфиге качалки нет {want!r}'
+          print(f'качалка засевается с {want}')
+          PY
+
       # Головы у раннера нет, поэтому окно собирается в виртуальном X-сервере.
       # Одной проверки «окно построилось» мало: она пропускает целый класс
       # ошибок — обращение к Tk из фонового потока. Поэтому цикл крутится, пока

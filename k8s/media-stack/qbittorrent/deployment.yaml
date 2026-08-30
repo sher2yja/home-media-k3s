@@ -46,6 +46,9 @@ spec:
               else
                 mkdir -p "$(dirname "$CONF")"
                 printf '%s\n' \
+                  '[BitTorrent]' \
+                  'Session\DefaultSavePath=/data/downloads' \
+                  '' \
                   '[Preferences]' \
                   'WebUI\Address=*' \
                   'WebUI\ServerDomains=*' \
@@ -53,7 +56,7 @@ spec:
                   'WebUI\Username=admin' \
                   "WebUI\\Password_PBKDF2=\"${QBT_PASSWORD_HASH}\"" \
                   > "$CONF"
-                echo "qBittorrent.conf засеян дефолтами WebUI-безопасности и паролем из Secret"
+                echo "qBittorrent.conf засеян путём для скачивания, дефолтами WebUI и паролем из Secret"
               fi
           env:
             - name: QBT_PASSWORD_HASH
