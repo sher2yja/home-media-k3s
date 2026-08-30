@@ -89,8 +89,14 @@ def service_status(host: str = "localhost") -> list[dict]:
     out = []
     state = config.load_state()
     services = list(config.SERVICES)
-    if config.PROFILE_BY_KEY.get(state.get("profile", ""), None) and \
-            config.PROFILE_BY_KEY[state["profile"]].with_monitoring:
+    profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
+    # Grafana в списке, если её ВЫБРАЛИ или если она РАБОТАЕТ. Второе — не
+    # перестраховка: профиль в состоянии говорит про выбор, а не про то, что
+    # развёрнуто. Стоит человеку выбрать простой профиль и на вопрос «удалить
+    # графики?» ответить «оставить» — графики работают, а кнопки на них нет, и
+    # пропала она у того, кто сам попросил их оставить. Обратное тоже полезно:
+    # профиль полный, Grafana не отвечает — строка покажет крестик, а не исчезнет.
+    if (profile and profile.with_monitoring) or service_alive(config.GRAFANA, host):
         services.append(config.GRAFANA)
     for s in services:
         alive = service_alive(s, host)

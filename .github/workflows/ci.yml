@@ -107,6 +107,45 @@ jobs:
           print('мониторинга нет  -> порт чужой:', c.detail)
           PY
 
+      # Ради графиков и выбирают полный профиль, поэтому кнопка на них не должна
+      # ни лежать под заголовком «работает само», ни пропадать из-за записанного
+      # профиля, ни вести на пустую главную Grafana.
+      - name: Кнопка на графики ведёт на дашборд и не зависит от профиля
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, 'app')
+          import config, media
+
+          assert config.GRAFANA.user_facing, \
+              'кнопка графиков уехала в «Служебное — работает само»'
+
+          # Профиль простой, а графики работают: так бывает после перехода
+          # «полный -> простой» с ответом «графики оставить».
+          config.load_state = lambda: {'profile': 'simple'}
+          media.service_alive = lambda s, host='localhost': True
+          rows = {r['key']: r for r in media.service_status()}
+          assert 'grafana' in rows, 'работающие графики пропали при простом профиле'
+          url = rows['grafana']['url']
+          assert url == config.grafana_dashboard_url(), url
+          assert '/d/' in url, f'кнопка ведёт на главную Grafana, а она пустая: {url}'
+          print('простой профиль + Grafana работает ->', url)
+
+          # Иначе проверка стала бы слепой: кнопка обязана пропадать, когда
+          # графиков нет вовсе.
+          media.service_alive = lambda s, host='localhost': False
+          assert 'grafana' not in {r['key'] for r in media.service_status()}, \
+              'Grafana в списке, хотя её не выбирали и она не отвечает'
+          print('простой профиль + Grafana молчит   -> кнопки нет')
+
+          # А выбранная, но упавшая Grafana обязана остаться крестиком: исчезнув,
+          # она выглядела бы как «графиков и не заказывали».
+          config.load_state = lambda: {'profile': 'full'}
+          rows = {r['key']: r for r in media.service_status()}
+          assert 'grafana' in rows and not rows['grafana']['alive'], rows.get('grafana')
+          print('полный профиль + Grafana молчит    -> строка с крестиком')
+          PY
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'
