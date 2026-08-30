@@ -354,6 +354,69 @@ jobs:
           print('повторный вызов ничего не задвоил')
           PY
 
+      # Обход Cloudflare разъезжается молча: прокси остаётся на месте и выглядит
+      # настроенным, а метки нет — и он не применяется ни к одному индексеру.
+      # Ровно так и случилось у первого живого пользователя. Проверяем оба
+      # конца метки, потому что нужны оба: и на прокси, и на индексере.
+      - name: Обход Cloudflare чинится сам
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, 'app')
+          import config, media, wire
+
+          config_dir = pathlib.Path.home() / 'hm-config'
+          key = media.arr_api_key(config_dir, 'prowlarr')
+
+          def proxy():
+              _, items, _ = wire._api('prowlarr', key, '/api/v1/indexerproxy')
+              found = [p for p in items or [] if p['implementation'] == 'FlareSolverr']
+              assert len(found) == 1, f'прокси должен быть один, а их {len(found)}'
+              return found[0]
+
+          # 1. Снимаем метку — так выглядит установка, сделанная до исправления.
+          broken = proxy()
+          broken['tags'] = []
+          code, _, reason = wire._api('prowlarr', key,
+                                      f"/api/v1/indexerproxy/{broken['id']}",
+                                      data=broken, method='PUT')
+          assert code in (200, 201, 202), f'не снялась метка: {code} {reason}'
+          assert proxy()['tags'] == [], 'метка не снялась'
+
+          step = wire.add_flaresolverr(key)
+          assert step.ok, f'починка не прошла: {step.detail}'
+          assert proxy()['tags'], 'метка не вернулась: прокси снова ни к чему не применяется'
+          print(f'прокси: {step.detail}')
+
+          # 2. Индексер человек добавляет сам и уже после установки. Заглушка на
+          # Torznab с недоступным адресом заводится мгновенно и в сеть не ходит:
+          # проверяем метку, а не работу трекера.
+          _, profiles, _ = wire._api('prowlarr', key, '/api/v1/appprofile')
+          _, schema, _ = wire._api('prowlarr', key, '/api/v1/indexer/schema')
+          entry = [s for s in schema if s['implementation'] == 'Torznab'][0]
+          entry.update(name='проба-меток', enable=False, tags=[],
+                       appProfileId=profiles[0]['id'])
+          wire._set_field(entry, 'baseUrl', 'http://127.0.0.1:1')
+          code, made, reason = wire._api('prowlarr', key,
+                                         '/api/v1/indexer?forceSave=true', data=entry)
+          assert code in (200, 201), f'заглушка не завелась: {code} {reason}'
+          assert made['tags'] == [], 'заглушка почему-то уже помечена'
+
+          step = wire.tag_indexers(key)
+          assert step.ok, f'метки не поставились: {step.detail}'
+          _, indexers, _ = wire._api('prowlarr', key, '/api/v1/indexer')
+          mine = [i for i in indexers if i['id'] == made['id']][0]
+          assert mine['tags'], 'индексер остался без метки — пойдёт мимо обхода'
+          print(f'индексеры: {step.detail}')
+
+          again = wire.tag_indexers(key)
+          assert again.ok and 'уже помечены' in again.detail, (
+              f'повторный вызов повёл себя иначе: {again.detail}')
+          print(f'повторный вызов: {again.detail}')
+
+          wire._api('prowlarr', key, f"/api/v1/indexer/{made['id']}", method='DELETE')
+          PY
+
       # Права на папку — то, из-за чего связывание падало с 400 без объяснения.
       # Раннер работает под uid 1001, в манифестах стоит 1000, и без apply_identity
       # контейнер не может писать в папку человека. Спрашиваем у самого сервиса.

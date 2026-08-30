@@ -181,12 +181,17 @@ def add_flaresolverr(prowlarr_key: str) -> Step:
     адресе — Cloudflare отдаёт страницу с задачей на JavaScript, а Prowlarr
     браузером не является. FlareSolverr эту задачу решает и отдаёт куки.
 
-    МЕТКА ОБЯЗАТЕЛЬНА, и это проверено измерением, а не взято из документации.
-    Прокси без меток Prowlarr не применяет ВООБЩЕ: тот же запрос уходит напрямую
-    и получает 403 за две секунды. С меткой он идёт через FlareSolverr и доходит
-    до формы входа за тридцать. Переключается в обе стороны, проверено дважды.
-    Сам индексер при этом помечать не нужно — хватает метки на прокси, и это
-    важно: человек добавляет сайт обычным образом, ни о чём не зная.
+    МЕТКА НУЖНА С ОБЕИХ СТОРОН — и на прокси, и на индексере. Это измерено на
+    живом Prowlarr, три состояния:
+
+        прокси с меткой, индексер без   -> 403 за 2.2 с, FlareSolverr не тронут
+        прокси с меткой, индексер с ней -> 200, в логах «Challenge solved!»
+        прокси без метки, индексер без  -> 403 за 2.1 с, FlareSolverr не тронут
+
+    То есть метка на прокси отвечает не за «включён», а за «к каким индексерам
+    применять». Прокси без меток не применяется ни к одному — документация
+    обещает обратное, но здесь верить измерению. Вторую половину работы —
+    метку на самих индексерах — делает tag_indexers.
     """
     title = "Обход проверки «вы не робот»"
     tag_id = _ensure_tag(prowlarr_key, FLARESOLVERR_TAG)
@@ -220,6 +225,47 @@ def add_flaresolverr(prowlarr_key: str) -> Step:
     code, _, reason = _api("prowlarr", prowlarr_key, "/api/v1/indexerproxy", data=entry)
     return (Step(title, True, "настроен: сайты за Cloudflare теперь доступны")
             if code in (200, 201) else _failed(title, code, reason))
+
+
+def tag_indexers(prowlarr_key: str) -> Step:
+    """Помечает уже добавленные индексеры меткой обхода Cloudflare.
+
+    Без метки индексер идёт мимо FlareSolverr и упирается в 403 — почему именно
+    так, измерено в add_flaresolverr. Индексеры человек добавляет сам и уже
+    после установки, поэтому шаг делает единственное, что установщику доступно:
+    помечает те, что есть на момент запуска. Добавили сайт позже — нажмите
+    кнопку ещё раз, метка встанет.
+
+    forceSave=true обязателен: обычный PUT заставляет Prowlarr заново сходить на
+    сайт и проверить индексер, а это тридцать секунд против пяти в media.TIMEOUT.
+    Запрос отвалился бы по таймауту, хотя метка при этом успевала сохраниться —
+    молчаливое «не сработало», которого не видно ни в одном ответе.
+    """
+    title = "Индексеры через обход"
+    tag_id = _ensure_tag(prowlarr_key, FLARESOLVERR_TAG)
+    if tag_id is None:
+        return Step(title, False, "Prowlarr не дал завести метку")
+
+    _, indexers, _ = _api("prowlarr", prowlarr_key, "/api/v1/indexer")
+    if not indexers:
+        return Step(title, True, "пока ни одного — добавьте сайт и нажмите кнопку снова")
+
+    marked = []
+    for indexer in indexers:
+        tags = indexer.get("tags") or []
+        if tag_id in tags:
+            continue
+        indexer["tags"] = [*tags, tag_id]
+        code, _, reason = _api("prowlarr", prowlarr_key,
+                               f"/api/v1/indexer/{indexer['id']}?forceSave=true",
+                               data=indexer, method="PUT")
+        if code not in (200, 201, 202):
+            return _failed(title, code, reason)
+        marked.append(indexer["name"])
+
+    if not marked:
+        return Step(title, True, f"все {len(indexers)} уже помечены")
+    return Step(title, True, "помечены: " + ", ".join(marked))
 
 
 def set_download_dir(password: str) -> Step:
@@ -365,9 +411,11 @@ def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
     if password:
         log(set_download_dir(password))
 
-    # Прокси тоже один на весь Prowlarr, а не по сервису.
+    # Прокси тоже один на весь Prowlarr, а не по сервису. Сразу за ним — метки
+    # на индексерах: без них прокси заведён, но не применяется ни к чему.
     if keys.get("prowlarr"):
         log(add_flaresolverr(keys["prowlarr"]))
+        log(tag_indexers(keys["prowlarr"]))
 
     for service in ("sonarr", "radarr"):
         if not keys.get(service):
