@@ -626,6 +626,12 @@ class App(tk.Tk):
         state = config.load_state()
         password = state.get("qbittorrent_password")
         profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
+        # Ключи API сервисы генерируют себе сами при первом запуске. Человеку они
+        # нужны ровно один раз — в мастере Jellyseerr, — и лезть за ними в чужие
+        # настройки незачем: читаем из тех же config.xml, что и всё остальное.
+        config_dir = Path(state.get("config_dir") or config.default_config_dir())
+        keys = {name: media.arr_api_key(config_dir, name)
+                for name in ("sonarr", "radarr")}
         blocks = [
             "ЧТО НУЖНО СДЕЛАТЬ ОДИН РАЗ ПОСЛЕ УСТАНОВКИ",
             "",
@@ -663,13 +669,37 @@ class App(tk.Tk):
             "2. Первым делом он спросит адрес Jellyfin. Впишите ровно это:",
             f"     Jellyfin URL: {config.BY_KEY['jellyfin'].key}",
             f"     Port:         {config.BY_KEY['jellyfin'].internal_port}",
-            ("   Не localhost и не тот адрес, что в браузере: Jellyseerr живёт "
-             "рядом с Jellyfin внутри сервера, и localhost для него — он сам."),
+            ("   В верхнее поле идёт ИМЯ буквами, в нижнее — порт. Вписать 8096 "
+             "в оба — самая частая ошибка: форма зависнет на «Signing In...»."),
+            ("   И не localhost, и не адрес из браузера: Jellyseerr живёт рядом с "
+             "Jellyfin внутри сервера, localhost для него — он сам."),
             "3. Логин и пароль — те же, что вы завели в Jellyfin на шаге 1.",
-            "4. Дальше мастер попросит адреса Sonarr и Radarr — вставьте эти:",
-            f"     Sonarr: {config.internal_url('sonarr')}",
-            f"     Radarr: {config.internal_url('radarr')}",
-            "   Ключ он подставит сам после нажатия «Test».",
+            ("4. Экран «Configure Media Server»: нажмите «Sync Libraries», включите "
+             "обе медиатеки — «Фильмы» и «Сериалы» — и нажмите «Start Scan»."),
+            ("   Выключенную медиатеку Jellyseerr не увидит. Скан идёт в фоне, "
+             "ждать его не нужно."),
+            ("   В «Jellyfin Settings» ниже не трогайте ничего: ключ создан сам, "
+             "External URL и Forgot Password URL оставьте пустыми."),
+            ("   Список медиатек пуст даже после «Sync Libraries» — значит на шаге 1 "
+             "они не заведены. Вернитесь в Jellyfin и добавьте обе."),
+            "5. Экран «Configure Services»: добавьте два сервера, Radarr и Sonarr.",
+            "   Поля заполняются так:",
+            "     Server Name             radarr            sonarr",
+            "     Hostname or IP Address  radarr            sonarr",
+            (f"     Port                    {config.BY_KEY['radarr'].internal_port}"
+             f"              {config.BY_KEY['sonarr'].internal_port}"),
+            "     Use SSL, URL Base       выключено, пусто",
+            ("   Поле «API Key» пустое, и само оно не заполнится — вставьте ключ "
+             "отсюда:"),
+            f"     Radarr API Key: {keys['radarr'] or 'не удалось прочитать'}",
+            f"     Sonarr API Key: {keys['sonarr'] or 'не удалось прочитать'}",
+            ("   Только ПОСЛЕ ключа жмите «Test»: по нему подтягиваются списки "
+             "«Quality Profile» и «Root Folder». Без ключа они пустые."),
+            "   В «Root Folder» выберите ту папку, что уже там есть:",
+            f"     Radarr: {config.ROOT_FOLDERS['radarr']}",
+            f"     Sonarr: {config.ROOT_FOLDERS['sonarr']}",
+            ("   «Quality Profile» — на ваш вкус, например HD-1080p. Остальные "
+             "переключатели оставьте как есть и нажмите «Add Server»."),
             "",
             ("ПРОВЕРЬТЕ, ЧТО НЕ ЗАДВОИЛОСЬ: Jellyseerr легко принимает Sonarr за "
              "второй Radarr — формы у них одинаковые, и зелёная кнопка «Test» это "
