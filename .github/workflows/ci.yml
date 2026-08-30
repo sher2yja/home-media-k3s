@@ -100,7 +100,9 @@ jobs:
           curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           ./kubectl kustomize deploy/k3s > /tmp/k3s.yaml
-          test "$(grep -c '^kind:' /tmp/k3s.yaml)" -eq 20
+          # 22 = namespace + 7 сервисов (deployment+service) + 7 заявок.
+          # FlareSolverr без PVC: ему нечего хранить между запусками.
+          test "$(grep -c '^kind:' /tmp/k3s.yaml)" -eq 22
           ! grep -q nodeSelector /tmp/k3s.yaml
           ! grep -q 'storageClassName: nfs' /tmp/k3s.yaml
           # Ни одной заявки на local-path: тома статические, их готовит установщик.
@@ -122,11 +124,26 @@ jobs:
           want = {s.port: s.internal_port for s in config.SERVICES}
           rendered = subprocess.run(['./kubectl', 'kustomize', 'deploy/k3s'],
                                     capture_output=True, text=True, check=True).stdout
+          # 'nodePort' in p — не перестраховка: FlareSolverr раздаётся как
+          # ClusterIP, наружу не смотрит и в таблице портов ему делать нечего.
+          # Без этого условия проверка падала бы на KeyError, а выглядело бы это
+          # как расхождение портов.
           k3s = {p['nodePort']: p['targetPort']
                  for d in yaml.safe_load_all(rendered) if d and d['kind'] == 'Service'
-                 for p in d['spec']['ports']}
+                 for p in d['spec']['ports'] if 'nodePort' in p}
           assert k3s == want, f'k3s разошёлся: {k3s} != {want}'
           print('порты k3s совпадают с app/config.py')
+
+          # Порт FlareSolverr в таблицу выше не входит, но разъехаться может так же:
+          # его знают манифест и wire.py, а сверять их больше нечему.
+          fs = [d for d in yaml.safe_load_all(rendered)
+                if d and d['kind'] == 'Service' and d['metadata']['name'] == 'flaresolverr']
+          assert len(fs) == 1, 'сервиса flaresolverr нет в оверлее'
+          assert fs[0]['spec']['type'] == 'ClusterIP', 'FlareSolverr не должен смотреть наружу'
+          assert fs[0]['spec']['ports'][0]['port'] == config.FLARESOLVERR_PORT, (
+              f"порт FlareSolverr разошёлся с app/config.py: "
+              f"{fs[0]['spec']['ports'][0]['port']} != {config.FLARESOLVERR_PORT}")
+          print(f'FlareSolverr: ClusterIP на {config.FLARESOLVERR_PORT}, как в app/config.py')
           PY
 
       # e2e ставит k3s сам через curl, поэтому скачивание установщика ИЗ

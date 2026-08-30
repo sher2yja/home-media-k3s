@@ -27,7 +27,7 @@ kind: Kustomization
 namespace: media
 
 resources:
-  - ../../k8s/media-stack   # namespace + 6 сервисов, общая часть
+  - ../../k8s/media-stack   # namespace + 7 сервисов, общая часть
   - media-pvc.yaml             # хранилище: местное вместо NFS
 
 patches:

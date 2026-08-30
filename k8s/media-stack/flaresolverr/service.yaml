@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: flaresolverr
+  namespace: media
+  labels:
+    app.kubernetes.io/name: flaresolverr
+    app.kubernetes.io/part-of: media-stack
+spec:
+  # ClusterIP, а не NodePort, — единственный такой сервис в стеке. Наружу ему
+  # смотреть незачем: с ним разговаривает только Prowlarr, изнутри кластера.
+  # Человеку он не показывается и в списке сервисов приложения не появляется.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: flaresolverr
+  ports:
+    - name: http
+      port: 8191
+      targetPort: 8191

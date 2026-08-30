@@ -156,6 +156,38 @@ def add_download_client(key: str, api_key: str, password: str) -> Step:
             else _failed(title, code, reason))
 
 
+def add_flaresolverr(prowlarr_key: str) -> Step:
+    """Учит Prowlarr проходить проверку Cloudflare.
+
+    Без этого крупные трекеры недоступны совсем, и выглядит это обманчиво: сайт
+    открывается у человека в браузере, а Prowlarr на том же компьютере отвечает
+    «Unable to connect to indexer... 403 Forbidden». Причина не в сети и не в
+    адресе — Cloudflare отдаёт страницу с задачей на JavaScript, а Prowlarr
+    браузером не является. FlareSolverr эту задачу решает и отдаёт куки.
+
+    Тег не назначаем намеренно. В Prowlarr прокси без тегов применяется ко ВСЕМ
+    индексерам, а с тегом — только к помеченным им вручную. Второе означало бы,
+    что человек добавляет сайт, получает 403 и должен сам догадаться сходить в
+    настройки и поставить тег. Ровно этого приложение и старается не допускать.
+    """
+    title = "Обход проверки «вы не робот»"
+    _, existing, _ = _api("prowlarr", prowlarr_key, "/api/v1/indexerproxy")
+    if any(p.get("implementation") == "FlareSolverr" for p in existing or []):
+        return Step(title, True, "уже настроен")
+
+    entry = _schema_entry("prowlarr", prowlarr_key, "/api/v1/indexerproxy/schema",
+                          "FlareSolverr")
+    if not entry:
+        return Step(title, False, "Prowlarr не предложил настроек для FlareSolverr")
+
+    entry["name"] = "FlareSolverr"
+    entry["tags"] = []          # пусто = для всех индексеров, см. docstring
+    _set_field(entry, "host", config.FLARESOLVERR_URL)
+    code, _, reason = _api("prowlarr", prowlarr_key, "/api/v1/indexerproxy", data=entry)
+    return (Step(title, True, "настроен: сайты за Cloudflare теперь доступны")
+            if code in (200, 201) else _failed(title, code, reason))
+
+
 def set_download_dir(password: str) -> Step:
     """Говорит качалке, куда складывать скачанное.
 
@@ -298,6 +330,10 @@ def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
     # Куда качать — настройка одна на всю качалку, поэтому до цикла по сервисам.
     if password:
         log(set_download_dir(password))
+
+    # Прокси тоже один на весь Prowlarr, а не по сервису.
+    if keys.get("prowlarr"):
+        log(add_flaresolverr(keys["prowlarr"]))
 
     for service in ("sonarr", "radarr"):
         if not keys.get(service):

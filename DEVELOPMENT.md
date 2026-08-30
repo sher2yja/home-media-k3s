@@ -67,7 +67,8 @@ apply_stack           kubectl apply -k deploy/k3s
 apply_monitoring      профиль «полный»: kubectl apply -f k8s/monitoring
 apply_identity        PUID/PGID по os.getuid() того, кто запустил установщик
 wait_for_pods         kubectl wait --for=condition=Ready pod --all
-wire.configure        папка для скачивания в качалке, качалка и корневые папки
+wire.configure        FlareSolverr в Prowlarr, папка для скачивания в качалке,
+                      качалка и корневые папки
                       в *arr, hardlink'и, Prowlarr → Sonarr/Radarr
 ```
 
@@ -125,6 +126,18 @@ PBKDF2 — способ однажды тихо разъехаться и пол
 он верен с первой секунды. Совпадение обоих мест с `config.DOWNLOADS_DIR`
 сверяет CI. Найдено живым прогоном: Sonarr и Radarr сами сообщали об этом в
 `/api/v3/health`, а установщик считал, что всё хорошо.
+
+**Проверка Cloudflare обходится седьмым сервисом, а не подбором заголовков.**
+Крупные трекеры отдают программе не страницу, а задачу на JavaScript
+(`cf-mitigated: challenge`), и Prowlarr получает `403`. Подделывать User-Agent
+бессмысленно — задачу надо выполнить, а не назваться браузером. FlareSolverr
+держит внутри headless-браузер: решает задачу и отдаёт куки. Он единственный в
+стеке без тома (хранить нечего) и единственный `ClusterIP` (наружу не смотрит,
+с ним разговаривает только Prowlarr). Прописывает его `wire.add_flaresolverr()`
+**без тегов**: в Prowlarr прокси без тегов действует на все индексеры, а с тегом
+человек добавил бы сайт, получил `403` и должен был бы сам догадаться сходить в
+настройки. Порт живёт в `config.FLARESOLVERR_PORT`, и CI сверяет его с манифестом
+так же, как сверяет NodePort'ы остальных.
 
 **Ключи API нигде не спрашиваются у пользователя.** \*arr держат их в своих
 `config.xml`, Jellyseerr — в `settings.json`, оба каталога на этой же машине.

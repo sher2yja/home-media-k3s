@@ -1,4 +1,5 @@
-# ОБЩАЯ часть медиастека: namespace и шесть сервисов. Хранилища здесь намеренно нет —
+# ОБЩАЯ часть медиастека: namespace и семь сервисов (шесть по NodePort плюс
+# FlareSolverr, который наружу не смотрит). Хранилища здесь намеренно нет —
 # оно у каждой формы развёртывания своё, и это главное, чем формы отличаются:
 #
 #   стенд (kubeadm) -> 20-nfs-media-pv.yaml + 21-nfs-media-pvc.yaml (RWX по NFS)
@@ -18,6 +19,8 @@ kind: Kustomization
 
 resources:
   - 00-namespace.yaml
+  - flaresolverr/deployment.yaml
+  - flaresolverr/service.yaml
   - jellyfin/deployment.yaml
   - jellyfin/pvc.yaml
   - jellyfin/service.yaml

@@ -1,0 +1,56 @@
+# Проходит проверку «докажи, что ты не робот» на сайтах за Cloudflare.
+#
+# Зачем он вообще нужен. Prowlarr — обычный HTTP-клиент, а Cloudflare на входе
+# отдаёт страницу с JavaScript-задачей и заголовком `cf-mitigated: challenge`.
+# Выполнить её может только браузер, поэтому Prowlarr получает 403 и сообщает
+# «Unable to connect to indexer», хотя сайт открывается у человека в браузере на
+# той же машине. FlareSolverr держит внутри headless-браузер: решает задачу,
+# получает куки и отдаёт их Prowlarr.
+#
+# Единственный сервис здесь БЕЗ тома: он ничего не хранит между запусками, и
+# терять ему нечего. Поэтому же у него нет PVC, а рестарт для него безболезнен.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flaresolverr
+  namespace: media
+  labels:
+    app.kubernetes.io/name: flaresolverr
+    app.kubernetes.io/part-of: media-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flaresolverr
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flaresolverr
+        app.kubernetes.io/part-of: media-stack
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-worker01
+      containers:
+        - name: flaresolverr
+          image: ghcr.io/flaresolverr/flaresolverr:latest
+          env:
+            - name: TZ
+              value: Etc/UTC
+            - name: LOG_LEVEL
+              value: info
+            # PUID/PGID тут не нужны: образ не от linuxserver.io и их не знает,
+            # а писать в папки человека этому сервису нечего.
+          ports:
+            - name: http
+              containerPort: 8191
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            # Гигабайт — не запас на всякий случай: внутри поднимается Chromium,
+            # и на время решения задачи он занимает заметно больше, чем в покое.
+            # С лимитом поменьше под убивают по OOM ровно в момент проверки, а
+            # выглядит это как «индексер иногда не добавляется».
+            limits:
+              cpu: "2"
+              memory: 1Gi
