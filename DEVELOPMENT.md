@@ -61,7 +61,7 @@ ensure_desktop_entry  пункт меню + иконка PNG (см. ниже, п
 prepare_dirs          создать папки от имени пользователя (не от root: контейнеры
                       linuxserver.io работают под PUID=1000 и иначе не запишут)
 ensure_cluster        pkexec env INSTALL_K3S_EXEC=... sh k3s-install.sh
-wait_for_node         kubectl wait --for=condition=Ready node --all
+wait_for_node         дождаться появления Node, потом condition=Ready
 create_secret         пароль торрента: генерация + PBKDF2, kubectl create secret
 apply_volumes         hostpath-volumes.yaml.tmpl с подставленными путями
 apply_stack           kubectl apply -k deploy/k3s
@@ -72,6 +72,18 @@ wire.configure        FlareSolverr в Prowlarr и метки на индексе
                       скачивания в торренте, торрент и корневые папки
                       в *arr, hardlink'и, Prowlarr → Sonarr/Radarr
 ```
+
+**`wait_for_node` ждёт в два шага, и это не перестраховка.** `kubectl wait --all` по
+ресурсу, которого ещё НЕТ, не ждёт вовсе — он мгновенно выходит с `no matching resources
+found`. Сразу после `systemd: Starting k3s` объект Node как раз не зарегистрирован.
+Одношаговая проверка превращала обычную медлительность машины в «Кластер не пришёл в
+готовность» через доли секунды после успешно поставленного k3s — сообщение, по которому
+человеку нечего делать. Проявлялось это только случайными падениями `e2e`: 30.08 упало на
+коммите, который этого кода не касался вовсе (между стартом k3s и вызовом прошло 8
+секунд, узел не успел). Теперь сначала опрос `get nodes` до появления узла, потом
+`condition=Ready` на остаток времени. Самопроверка `install.py` подменяет `kubectl` и
+`time.sleep` и проходит оба исхода, включая тот, где узла нет вовсе.
+
 
 Отдельный бинарь `kubectl` не ставится: k3s несёт его в себе (`k3s kubectl`), а
 kustomize встроен в сам kubectl.

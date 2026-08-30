@@ -217,13 +217,39 @@ def ensure_cluster(on_line=None) -> None:
         install_k3s_linux(on_line)
 
 
+NODE_POLL = 2   # как часто спрашивать, появился ли узел
+
+
 def wait_for_node(timeout: int = 300, on_line=None) -> None:
     """Сразу после установки kubelet ещё регистрируется, и apply падает на
-    «no such host». Ждём готовности ноды, а не спим фиксированное время."""
+    «no such host». Ждём готовности ноды, а не спим фиксированное время.
+
+    Двумя шагами, и это не перестраховка. `kubectl wait --all` по ресурсу,
+    которого ЕЩЁ НЕТ, не ждёт вовсе: он мгновенно выходит с «no matching
+    resources found». А сразу после установки Node как раз не зарегистрирован.
+    Одношаговая проверка превращала обычную медлительность машины в «Кластер не
+    пришёл в готовность» через доли секунды после успешно поставленного k3s —
+    сообщение, по которому человеку нечего делать. Ловилось это только
+    случайными падениями e2e, и один раз упало на коммите, который этого кода
+    не касался вовсе.
+    """
     if on_line:
         on_line("Жду, пока кластер станет готов")
+    deadline = time.monotonic() + timeout
+    while True:
+        r = kubectl("get", "nodes", "-o", "name", timeout=60)
+        if r.returncode == 0 and r.stdout.strip():
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Кластер не поднялся: узел не зарегистрировался за {timeout} с. "
+                + r.stdout[-2000:])
+        time.sleep(NODE_POLL)
+    # Остаток времени отдаём ожиданию готовности, но не меньше полминуты: узел
+    # только что появился, и на condition=Ready ему нужно ещё немного.
+    left = max(30, int(deadline - time.monotonic()))
     r = kubectl("wait", "--for=condition=Ready", "node", "--all",
-                f"--timeout={timeout}s", on_line=on_line, timeout=timeout + 60)
+                f"--timeout={left}s", on_line=on_line, timeout=left + 60)
     if r.returncode != 0:
         raise RuntimeError("Кластер не пришёл в готовность: " + r.stdout[-2000:])
 
@@ -1050,6 +1076,41 @@ def _self_check() -> None:
     assert '"/tmp/media"' in rendered
     assert '"/tmp/cfg/jellyfin"' in rendered
     assert rendered.count("kind: PersistentVolume") == 7
+
+    # Ожидание узла. Проверяем именно то, из-за чего e2e падал на ровном месте:
+    # узел появляется не сразу, а kubectl wait по несуществующему ресурсу
+    # выходит мгновенно. Внешних команд тут нет — kubectl и sleep подменены.
+    global kubectl
+    real_kubectl, real_sleep = kubectl, time.sleep
+    seen: list[tuple] = []
+
+    def fake(*args, **_kw):
+        seen.append(args)
+        gets = [c for c in seen if c[0] == "get"]
+        # Узел регистрируется только к третьему опросу.
+        out = "" if args[0] == "get" and len(gets) < 3 else "node/home"
+        return subprocess.CompletedProcess(args, 0, out)
+
+    kubectl, time.sleep = fake, lambda _s: None
+    try:
+        wait_for_node(timeout=60)
+        assert len([c for c in seen if c[0] == "get"]) == 3, seen
+        assert any(c[0] == "wait" for c in seen), "готовность узла не проверялась"
+
+        # Узел не появился вовсе — обязана быть внятная ошибка, а не молчаливый
+        # переход к apply, который упадёт потом и непонятно почему.
+        seen.clear()
+        kubectl = lambda *a, **k: subprocess.CompletedProcess(a, 0, "")
+        try:
+            wait_for_node(timeout=0)
+        except RuntimeError as e:
+            assert "не зарегистрировался" in str(e), e
+        else:
+            raise AssertionError("пустой список узлов принят за готовый кластер")
+        assert not [c for c in seen if c[0] == "wait"], \
+            "kubectl wait вызван по несуществующему узлу — ровно то, что чинили"
+    finally:
+        kubectl, time.sleep = real_kubectl, real_sleep
 
     # Пункт меню собирается без обращения к диску: подстановка не должна оставлять
     # незаполненных мест, а имя класса — расходиться с тем, что ставит окно.
