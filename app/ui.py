@@ -24,6 +24,7 @@ import config
 import icon
 import install
 import media
+import wire
 
 PAD = 10
 
@@ -64,6 +65,7 @@ class App(tk.Tk):
 
         self._events: queue.Queue = queue.Queue()
         self._busy = False
+        self._recheck_job: str | None = None
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
@@ -123,7 +125,8 @@ class App(tk.Tk):
 
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for button in (self.install_button, self.recheck_button, self.repair_button):
+        for button in (self.install_button, self.recheck_button,
+                       self.repair_button, self.wire_button):
             button.configure(state=state)
         if busy:
             self.progress.start(12)
@@ -174,6 +177,12 @@ class App(tk.Tk):
             folders, "Настройки (небольшая папка, трогать не нужно)",
             config.default_config_dir())
 
+        # Проверка места считается для ВЫБРАННОЙ папки, поэтому её надо
+        # пересчитывать при смене пути, а не только по кнопке: иначе человек
+        # переносит медиатеку на другой диск, а видит свободное место на старом.
+        # Пауза — чтобы не пересчитывать на каждую букву при ручном вводе.
+        self.media_dir.trace_add("write", self._media_dir_changed)
+
         self.install_button = ttk.Button(tab, text="Установить", command=self.do_install)
         self.install_button.pack(anchor="w", pady=PAD)
         self.progress = ttk.Progressbar(tab, mode="indeterminate")
@@ -200,7 +209,13 @@ class App(tk.Tk):
         if chosen:
             var.set(chosen)
 
+    def _media_dir_changed(self, *_args) -> None:
+        if self._recheck_job:
+            self.after_cancel(self._recheck_job)
+        self._recheck_job = self.after(700, self.refresh_checks)
+
     def refresh_checks(self) -> None:
+        self._recheck_job = None
         for child in self.checks_frame.winfo_children():
             child.destroy()
         ttk.Label(self.checks_frame, text="Проверяю…").pack(anchor="w")
@@ -209,7 +224,9 @@ class App(tk.Tk):
         # проверку с «main thread is not in main loop» — а выглядит это как
         # «предпроверки не работают», без всякого намёка на причину.
         media_dir = Path(self.media_dir.get())
-        self.run_bg(lambda log: install.preflight(media_dir), self._show_checks)
+        if not self.run_bg(lambda log: install.preflight(media_dir), self._show_checks):
+            # Занято другой работой — не теряем запрос, а повторяем позже.
+            self._recheck_job = self.after(500, self.refresh_checks)
 
     def _show_checks(self, checks) -> None:
         for child in self.checks_frame.winfo_children():
@@ -242,6 +259,8 @@ class App(tk.Tk):
         media_dir = Path(self.media_dir.get())
         config_dir = Path(self.config_dir.get())
         profile = self.profile.get()
+        if config.installed() and self._offer_migration(config_dir, media_dir):
+            return
         # Не пытаемся ставить поверх непройденных проверок: сообщение kubectl о
         # том, почему не вышло, человеку ничего не скажет, а наши проверки — скажут.
         failures = install.blocking_failures(install.preflight(media_dir))
@@ -254,6 +273,56 @@ class App(tk.Tk):
         self.run_bg(
             lambda log: install.install(profile, config_dir, media_dir, on_line=log),
             self._install_done)
+
+    def _offer_migration(self, config_dir: Path, media_dir: Path) -> bool:
+        """Папки меняют уже после установки. Возвращает True, если взяли работу на себя.
+
+        Молча переустанавливать нельзя: тома уже созданы, фильмы остались бы в
+        старой папке, а библиотека стала бы пустой — без единого сообщения об
+        ошибке. Поэтому сначала объясняем, потом предлагаем перенести, и только
+        с согласия трогаем данные.
+        """
+        plan = install.migration_plan(config_dir, media_dir)
+        if not plan["needed"]:
+            return False
+        old_config, old_media = install.installed_paths()
+
+        if not plan["ok"]:
+            messagebox.showerror("Перенести не получится", plan["reason"])
+            return True
+
+        size = (" Переносить почти нечего, это быстро." if plan["instant"]
+                else f" Нужно перенести {plan['bytes'] / 1024 ** 3:.1f} ГБ, "
+                     f"это может занять долго.")
+        if not messagebox.askyesno("Папки уже выбраны при установке", (
+                f"Сейчас фильмы лежат в {old_media},\n"
+                f"настройки — в {old_config}.\n\n"
+                "Сами по себе они не переедут: если просто поменять путь, "
+                "библиотека станет пустой, а файлы останутся на старом месте.\n\n"
+                f"Перенести всё в новые папки?{size}\n\n"
+                "На время переноса сервисы будут остановлены. Если что-то пойдёт "
+                "не так, программа вернёт всё как было.")):
+            # Отказались — возвращаем поля к тому, что реально установлено, чтобы
+            # на экране не осталось вранья про несуществующие папки.
+            self.media_dir.set(str(old_media))
+            self.config_dir.set(str(old_config))
+            return True
+
+        self.run_bg(lambda log: install.migrate(config_dir, media_dir, on_line=log),
+                    self._migration_done)
+        return True
+
+    def _migration_done(self, result) -> None:
+        if isinstance(result, Exception):
+            messagebox.showerror("Не получилось", str(result))
+            return
+        if result["ok"]:
+            messagebox.showinfo("Перенесено",
+                                "Файлы на новом месте, сервисы запускаются заново.")
+            self.notebook.select(1)
+            self.refresh_dashboard()
+        else:
+            messagebox.showerror("Не получилось", result["reason"])
 
     def _install_done(self, result) -> None:
         if isinstance(result, install.RebootRequired):
@@ -333,10 +402,16 @@ class App(tk.Tk):
         buttons.pack(fill="x", pady=PAD)
         ttk.Button(buttons, text="Обновить",
                    command=self.refresh_dashboard).pack(side="left")
+        self.wire_button = ttk.Button(buttons, text="Связать сервисы",
+                                      command=self.do_wire)
+        self.wire_button.pack(side="left", padx=(6, 0))
         self.repair_button = ttk.Button(buttons, text="Перепроверить и починить",
                                         command=self.do_repair)
         self.repair_button.pack(side="left", padx=(6, 0))
         ttk.Label(tab, foreground="#555", wraplength=760, text=(
+            "«Связать сервисы» — рассказывает сервисам друг о друге: поиск, качалку, "
+            "куда складывать готовое. Делается при установке само, кнопка нужна, "
+            "если что-то не успело подняться.\n"
             "«Перепроверить и починить» возвращает сервисы к правильным настройкам. "
             "Фильмы и настройки при этом не пропадают."
         )).pack(anchor="w")
@@ -371,6 +446,25 @@ class App(tk.Tk):
                    command=lambda: webbrowser.open(service["url"])).pack(side="left")
         ttk.Label(row, text=f"{service['text']}. {service['blurb']}", wraplength=600,
                   foreground="#555").pack(side="left", padx=(8, 0))
+
+    def do_wire(self) -> None:
+        self.notebook.select(0)   # лог живёт на первой вкладке — переключаемся к нему
+        self.run_bg(lambda log: wire.configure(on_line=log), self._wire_done)
+
+    def _wire_done(self, steps) -> None:
+        if isinstance(steps, Exception):
+            messagebox.showerror("Не получилось", str(steps))
+            return
+        failed = [s for s in steps if not s.ok]
+        text = "\n".join(f"{'✓' if s.ok else '✕'} {s.title}: {s.detail}" for s in steps)
+        if failed:
+            messagebox.showwarning(
+                "Связано не всё",
+                text + "\n\nЧаще всего это значит, что сервис ещё поднимается. "
+                       "Подождите пару минут и нажмите кнопку снова.")
+        else:
+            messagebox.showinfo("Сервисы связаны", text)
+        self.notebook.select(1)
 
     def do_repair(self) -> None:
         self.notebook.select(0)   # лог живёт на первой вкладке — переключаемся к нему
@@ -487,12 +581,53 @@ class App(tk.Tk):
         password = state.get("qbittorrent_password")
         profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
         blocks = [
+            "ЧТО НУЖНО СДЕЛАТЬ ОДИН РАЗ ПОСЛЕ УСТАНОВКИ",
+            "",
+            ("Программа уже связала сервисы между собой: рассказала им про поиск, "
+             "про качалку и про то, куда складывать готовое. Осталось три шага, "
+             "которые за вас никто не сделает — в них нужен ваш выбор."),
+            "",
+            "ШАГ 1. Завести себя в Jellyfin и показать ему папки",
+            "1. Откройте Jellyfin на вкладке «Мой сервер».",
+            ("2. Он попросит придумать логин и пароль — это ваша учётная запись, "
+             "ею же вы будете входить с телефона и телевизора."),
+            "3. Когда спросит про медиатеку, добавьте две:",
+            f"     «Фильмы»  -> {config.ROOT_FOLDERS['radarr']}",
+            f"     «Сериалы» -> {config.ROOT_FOLDERS['sonarr']}",
+            ("   Указывайте именно эти пути и именно эту глубину: папку НАД "
+             "фильмами, а не сам фильм. Иначе Jellyfin ничего не найдёт."),
+            "",
+            "ШАГ 2. Выбрать, где искать (Prowlarr)",
+            "1. Откройте Prowlarr на вкладке «Мой сервер».",
+            ("2. «Indexers» -> «Add Indexer» и добавьте те сайты, которыми "
+             "пользуетесь."),
+            ("3. Больше ничего там делать не нужно: про Sonarr и Radarr Prowlarr "
+             "уже знает, добавленный сайт появится у них сам."),
+            "",
+            ("Это единственный шаг, который нельзя сделать за вас: список сайтов "
+             "у каждого свой, а некоторые требуют регистрации."),
+            "",
+            "ШАГ 3. Пройти мастер Jellyseerr",
+            "1. Откройте Jellyseerr на вкладке «Мой сервер».",
+            "2. Войдите учётной записью Jellyfin из шага 1.",
+            "3. Мастер попросит адреса Sonarr и Radarr — вставьте эти:",
+            f"     Sonarr: {config.internal_url('sonarr')}",
+            f"     Radarr: {config.internal_url('radarr')}",
+            "   Ключ он подставит сам после нажатия «Test».",
+            "",
+            ("ПРОВЕРЬТЕ, ЧТО НЕ ЗАДВОИЛОСЬ: Jellyseerr легко принимает Sonarr за "
+             "второй Radarr — формы у них одинаковые, и зелёная кнопка «Test» это "
+             "не ловит. Сериалы должны быть в разделе Sonarr, фильмы — в Radarr."),
+            "",
+            "=" * 60,
+            "",
             "ПОСМОТРЕТЬ ФИЛЬМ",
             "1. Откройте Jellyfin на вкладке «Мой сервер».",
             "2. Выберите фильм и нажмите «Смотреть».",
             "",
             ("С телевизора или телефона: установите приложение Jellyfin и укажите "
-             "ему адрес этого компьютера в домашней сети, порт 30096."),
+             f"ему адрес этого компьютера в домашней сети, порт "
+             f"{config.BY_KEY['jellyfin'].port}."),
             "",
             "ЗАКАЗАТЬ ФИЛЬМ, КОТОРОГО НЕТ",
             "1. Откройте Jellyseerr на вкладке «Мой сервер».",
@@ -505,7 +640,8 @@ class App(tk.Tk):
         if password:
             blocks += ["ПАРОЛЬ КАЧАЛКИ",
                        f"Логин admin, пароль {password}.",
-                       "Нужен, только если вы настраиваете qBittorrent руками.", ""]
+                       ("Программа уже вписала его куда надо. Он нужен, только "
+                        "если вы полезете в настройки qBittorrent сами."), ""]
         if profile and profile.with_monitoring:
             blocks += ["ГРАФИКИ НАГРУЗКИ",
                        f"Grafana: {config.service_url(config.GRAFANA)}",

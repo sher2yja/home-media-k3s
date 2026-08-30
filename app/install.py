@@ -34,6 +34,7 @@ from pathlib import Path, PureWindowsPath
 
 import config
 import icon
+import wire
 
 # --- Где лежат манифесты ----------------------------------------------------
 
@@ -470,6 +471,247 @@ def create_qbittorrent_secret(on_line=None) -> str | None:
     return password
 
 
+# --- Перенос в другие папки -------------------------------------------------
+
+# Почему это отдельная и осторожная операция, а не просто «повторить установку с
+# другим путём». Тома уже созданы и связаны с заявками, а hostPath у связанного
+# тома не переехал бы сам. Повторная установка молча оставила бы фильмы в старой
+# папке, а библиотека стала бы пустой — человек решил бы, что всё пропало.
+
+
+def installed_paths() -> tuple[Path, Path]:
+    state = config.load_state()
+    return (Path(state.get("config_dir") or config.default_config_dir()),
+            Path(state.get("media_dir") or config.default_media_dir()))
+
+
+def _unique_files_size(path: Path) -> int:
+    """Размер с учётом жёстких ссылок: один inode считается один раз."""
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for entry in path.rglob("*"):
+        try:
+            if not entry.is_file() or entry.is_symlink():
+                continue
+            info = entry.stat()
+            ident = (info.st_dev, info.st_ino)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            total += info.st_size
+        except OSError:
+            continue
+    return total
+
+
+def _same_filesystem(a: Path, b: Path) -> bool:
+    """На одной файловой системе перенос мгновенный и места не требует."""
+    def device(path: Path) -> int:
+        probe = path
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return probe.stat().st_dev
+    try:
+        return device(a) == device(b)
+    except OSError:
+        return False
+
+
+def migration_plan(new_config_dir: Path, new_media_dir: Path) -> dict:
+    """Что произойдёт при переносе и можно ли его вообще делать.
+
+    Считается ДО того, как что-то остановлено и сдвинуто: если места не хватает,
+    человек должен узнать это раньше, чем сервисы выключатся.
+    """
+    old_config, old_media = installed_paths()
+    moves = [(old, new) for old, new in
+             ((old_media, new_media_dir), (old_config, new_config_dir))
+             if old.resolve() != new.resolve()]
+    if not moves:
+        return {"ok": True, "needed": False, "reason": "", "bytes": 0, "instant": True}
+
+    # Непустая папка назначения — отказ. Перенос в неё смешал бы старые файлы с
+    # новыми, и разобрать это потом было бы нечем.
+    for _, new in moves:
+        if new.exists() and any(new.iterdir()):
+            return {"ok": False, "needed": True, "bytes": 0, "instant": False,
+                    "reason": f"Папка {new} не пуста. Выберите пустую или новую — "
+                              f"иначе старые файлы смешаются с тем, что там лежит."}
+
+    need = 0
+    instant = True
+    for old, new in moves:
+        if _same_filesystem(old, new):
+            continue        # os.rename в пределах диска: мгновенно и без места
+        instant = False
+        need += _unique_files_size(old)
+
+    if need:
+        probe = new_media_dir
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        free = shutil.disk_usage(probe).free
+        if free < need:
+            return {"ok": False, "needed": True, "bytes": need, "instant": False,
+                    "reason": f"Не хватит места: нужно {need / 1024**3:.1f} ГБ, "
+                              f"а свободно {free / 1024**3:.1f} ГБ. "
+                              f"Ничего не тронуто, всё осталось как было."}
+    return {"ok": True, "needed": True, "bytes": need, "instant": instant, "reason": ""}
+
+
+def _move_entries(old: Path, new: Path, on_line=None) -> list[tuple[Path, Path]]:
+    """Перенос в пределах одной файловой системы: переименование.
+
+    Мгновенно, места не требует и — главное — сохраняет жёсткие ссылки как есть:
+    файл не двигается, меняется только запись в каталоге.
+    """
+    moved: list[tuple[Path, Path]] = []
+    new.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(old.iterdir()):
+        target = new / entry.name
+        if on_line:
+            on_line(f"  переношу {entry.name}")
+        shutil.move(str(entry), str(target))
+        moved.append((target, entry))
+    return moved
+
+
+def _copy_preserving_links(old: Path, new: Path, on_line=None) -> None:
+    """Копирование на ДРУГОЙ диск, с сохранением жёстких ссылок.
+
+    Почему не shutil.copytree и не shutil.move. Между файловыми системами они
+    копируют каждый путь отдельно, и файл, лежавший под двумя именами как одна
+    запись на диске, превращается в две. Медиатека занимает вдвое больше места,
+    ошибки при этом нет, и весь смысл общего тома для downloads и library
+    пропадает — а он и есть причина, по которой они лежат рядом.
+
+    Поэтому запоминаем, какой inode уже скопирован, и для повторов делаем ссылку
+    вместо второй копии. Источник не трогаем: удалять его можно только после
+    того, как копия целиком удалась.
+    """
+    copied: dict[tuple[int, int], Path] = {}
+    new.mkdir(parents=True, exist_ok=True)
+    for source in sorted(old.rglob("*")):
+        target = new / source.relative_to(old)
+        if source.is_dir() and not source.is_symlink():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        info = source.stat()
+        ident = (info.st_dev, info.st_ino)
+        if info.st_nlink > 1 and ident in copied:
+            os.link(copied[ident], target)
+            continue
+        if on_line:
+            on_line(f"  копирую {source.relative_to(old)}")
+        shutil.copy2(source, target)
+        if info.st_nlink > 1:
+            copied[ident] = target
+
+
+def _transfer(old: Path, new: Path, on_line=None) -> list[tuple[Path, Path]]:
+    """Переносит содержимое папки тем способом, который здесь уместен.
+
+    Возвращает список для отката, если перенос был переименованием. При копировании
+    между дисками откатывать нечего: источник остаётся на месте до самого конца.
+    """
+    if _same_filesystem(old, new):
+        return _move_entries(old, new, on_line)
+    if on_line:
+        on_line("  другой диск — копирую с сохранением жёстких ссылок")
+    _copy_preserving_links(old, new, on_line)
+    return []
+
+
+def _undo_moves(moved: list[tuple[Path, Path]], on_line=None) -> None:
+    """Откат переименований, в обратном порядке.
+
+    Ошибки здесь глотаем намеренно: мы уже в аварийной ветке, и упасть посреди
+    отката хуже, чем вернуть столько, сколько получится.
+    """
+    for target, original in reversed(moved):
+        try:
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(target), str(original))
+            if on_line:
+                on_line(f"  вернул {original.name}")
+        except OSError:
+            continue
+
+
+def scale_stack(replicas: int, on_line=None) -> None:
+    kubectl("scale", "deployment", "--all", "-n", "media",
+            f"--replicas={replicas}", on_line=on_line, timeout=180)
+    if replicas == 0:
+        # Ждём именно исчезновения подов: пока под жив, том смонтирован, и
+        # перенос файлов из-под него дал бы половину переехавшей медиатеки.
+        kubectl("wait", "--for=delete", "pod", "--all", "-n", "media",
+                "--timeout=180s", on_line=on_line, timeout=240)
+
+
+def _release_volumes(on_line=None) -> None:
+    """Снимает заявки и тома. Данные остаются: у всех томов политика Retain."""
+    kubectl("delete", "pvc", "--all", "-n", "media", "--timeout=120s",
+            on_line=on_line, timeout=180)
+    kubectl("delete", "pv", "-l", "app.kubernetes.io/part-of=media-stack",
+            "--timeout=120s", on_line=on_line, timeout=180)
+
+
+def migrate(new_config_dir: Path, new_media_dir: Path, on_line=None) -> dict:
+    """Переносит установку в другие папки. При любом сбое возвращает как было."""
+    plan = migration_plan(new_config_dir, new_media_dir)
+    if not plan["ok"] or not plan["needed"]:
+        return plan
+
+    old_config, old_media = installed_paths()
+    if on_line:
+        on_line("Останавливаю сервисы — при работающих переносить нельзя")
+    scale_stack(0, on_line)
+    _release_volumes(on_line)
+
+    moved: list[tuple[Path, Path]] = []
+    copied_from: list[Path] = []
+    try:
+        for old, new in ((old_media, new_media_dir), (old_config, new_config_dir)):
+            if old.resolve() == new.resolve():
+                continue
+            if on_line:
+                on_line(f"Переношу {old} -> {new}")
+            done = _transfer(old, new, on_line)
+            moved += done
+            if not done:
+                copied_from.append(old)     # копия сделана, источник ещё цел
+    except OSError as error:
+        if on_line:
+            on_line(f"Не получилось перенести: {error}. Возвращаю как было")
+        _undo_moves(moved, on_line)
+        # Недоделанные копии убираем: источник цел, а половина копии только
+        # запутает и займёт место.
+        for old in copied_from:
+            target = new_media_dir if old == old_media else new_config_dir
+            shutil.rmtree(target, ignore_errors=True)
+        apply_volumes(old_config, old_media, on_line)
+        apply_stack(on_line)
+        return {"ok": False, "needed": True, "bytes": plan["bytes"], "instant": False,
+                "reason": f"Перенос не удался: {error}. Всё возвращено на место, "
+                          f"сервисы запускаются заново."}
+
+    # Источник сносим только теперь, когда копия целиком удалась. До этой строки
+    # любой сбой оставлял человека с нетронутой медиатекой на старом месте.
+    for old in copied_from:
+        shutil.rmtree(old, ignore_errors=True)
+
+    config.save_state(config_dir=str(new_config_dir), media_dir=str(new_media_dir))
+    prepare_dirs(new_config_dir, new_media_dir)
+    apply_volumes(new_config_dir, new_media_dir, on_line)
+    result = apply_stack(on_line)
+    if result.returncode == 0:
+        wait_for_volumes(on_line=on_line)
+    return {"ok": result.returncode == 0, "needed": True, "bytes": plan["bytes"],
+            "instant": plan["instant"],
+            "reason": "" if result.returncode == 0 else result.stdout[-2000:]}
+
+
 # --- Установка целиком ------------------------------------------------------
 
 def wait_for_volumes(timeout: int = 180, on_line=None) -> None:
@@ -533,8 +775,19 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
     # create_qbittorrent_secret вернёт None, и затирать сохранённый было бы потерей.
     if password:
         config.save_state(qbittorrent_password=password)
+
+    # Связываем сервисы сразу: между «установлено» и «можно смотреть» иначе лежит
+    # полчаса ручной работы в четырёх чужих интерфейсах. Не получилось — не повод
+    # объявлять установку неудачной, кнопка «Связать сервисы» повторит.
+    steps = []
+    if result.returncode == 0:
+        if on_line:
+            on_line("Связываю сервисы между собой")
+        steps = wire.configure(config_dir, on_line=on_line)
+
     return {
         "ok": result.returncode == 0,
+        "steps": steps,
         "qbittorrent_password": password or config.load_state().get("qbittorrent_password"),
         "stdout": result.stdout,
         "stderr": "",
@@ -722,6 +975,39 @@ def _self_check() -> None:
     entry = DESKTOP_ENTRY.format(command="/bin/true", icon=DESKTOP_ID, wmclass=DESKTOP_ID)
     assert "{" not in entry, "в шаблоне пункта меню остались плейсхолдеры"
     assert f"StartupWMClass={DESKTOP_ID}" in entry
+
+    # Перенос медиатеки: главное здесь — жёсткие ссылки. Файл, лежащий под двумя
+    # именами как одна запись на диске, обязан остаться одной записью и после
+    # переезда. Иначе медиатека тихо занимает вдвое больше места.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "src"
+        (source / "library").mkdir(parents=True)
+        film = source / "film.mkv"
+        film.write_bytes(b"x" * 4096)
+        os.link(film, source / "library" / "film.mkv")
+        assert _unique_files_size(source) == 4096, "hardlink посчитан дважды"
+
+        same = Path(tmp) / "same-fs"
+        _transfer(source, same)
+        moved = (same / "film.mkv").stat()
+        assert moved.st_ino == (same / "library" / "film.mkv").stat().st_ino
+        assert not film.exists(), "переименование должно опустошить источник"
+
+        # Копирование между файловыми системами — та ветка, где ссылки легче
+        # всего потерять. Проверяем её, если в системе есть tmpfs.
+        other = Path("/dev/shm")
+        if other.is_dir() and not _same_filesystem(same, other):
+            far = other / "home-media-k3s-selfcheck"
+            shutil.rmtree(far, ignore_errors=True)
+            try:
+                _transfer(same, far)
+                a = (far / "film.mkv").stat()
+                b = (far / "library" / "film.mkv").stat()
+                assert a.st_ino == b.st_ino, "ссылка распалась при переезде на другой диск"
+                assert (same / "film.mkv").exists(), "источник сносить рано"
+            finally:
+                shutil.rmtree(far, ignore_errors=True)
 
     hashed = qbittorrent_pbkdf2("проверка")
     assert hashed.startswith("@ByteArray(") and hashed.endswith(")")

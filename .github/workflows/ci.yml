@@ -46,6 +46,9 @@ jobs:
       - name: Самопроверка иконки
         run: cd app && python icon.py
 
+      - name: Самопроверка связывания сервисов
+        run: cd app && python wire.py
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'
@@ -227,6 +230,47 @@ jobs:
           for s in statuses:
               print(f"{s['title']}: {s['text']}")
           assert all(s['alive'] for s in statuses), 'не все сервисы отвечают'
+          PY
+
+      # Единственное место, где API Sonarr, Radarr и Prowlarr проверяются
+      # по-настоящему: подделывать их ответы бессмысленно — разъедется как раз то,
+      # что подделано. install.install() уже вызвал wire.configure(); здесь
+      # проверяем, что связки действительно легли в конфиги сервисов.
+      - name: Сервисы связаны между собой
+        run: |
+          python - <<'PY'
+          import pathlib, sys, time
+          sys.path.insert(0, 'app')
+          import config, media, wire
+
+          config_dir = pathlib.Path.home() / 'hm-config'
+          steps = wire.configure(config_dir, on_line=print)
+          failed = [s for s in steps if not s.ok]
+          assert not failed, f'не связалось: {failed}'
+
+          # Проверяем не свой возврат, а состояние сервисов: спрашиваем у них.
+          for svc, folder in config.ROOT_FOLDERS.items():
+              key = media.arr_api_key(config_dir, svc)
+              _, clients = wire._api(svc, key, '/api/v3/downloadclient')
+              assert any(c['name'] == 'qBittorrent' for c in clients), f'{svc}: качалки нет'
+              _, roots = wire._api(svc, key, '/api/v3/rootfolder')
+              assert any(r['path'].rstrip('/') == folder for r in roots), f'{svc}: нет {folder}'
+              _, mm = wire._api(svc, key, '/api/v3/config/mediamanagement')
+              assert mm['copyUsingHardlinks'], f'{svc}: hardlink не включён'
+              print(f'{svc}: качалка, папка {folder}, hardlink — на месте')
+
+          prowlarr = media.arr_api_key(config_dir, 'prowlarr')
+          _, apps = wire._api('prowlarr', prowlarr, '/api/v1/applications')
+          names = {a['name'] for a in apps or []}
+          assert {'sonarr', 'radarr'} <= names, f'Prowlarr знает только про {names}'
+          print('Prowlarr связан с Sonarr и Radarr')
+
+          # Повторный вызов не должен ничего задвоить: кнопку нажмут дважды.
+          wire.configure(config_dir)
+          _, clients = wire._api('sonarr', media.arr_api_key(config_dir, 'sonarr'),
+                                 '/api/v3/downloadclient')
+          assert len(clients) == 1, f'качалка задвоилась: {len(clients)}'
+          print('повторный вызов ничего не задвоил')
           PY
 
       - name: Что было в логах, если упало
