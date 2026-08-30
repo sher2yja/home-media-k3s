@@ -53,7 +53,10 @@ def overlay_dir() -> Path:
 
 
 def monitoring_dir() -> Path:
-    return bundle_root() / "k8s" / "monitoring"
+    # Оверлей, а не k8s/monitoring напрямую. База несёт nodeSelector на узел
+    # стенда, и без патча Prometheus с Grafana вставали в Pending навсегда —
+    # молча, потому что apply при этом отрабатывает успешно.
+    return bundle_root() / "deploy" / "k3s" / "monitoring"
 
 
 # --- Пароль qBittorrent -----------------------------------------------------
@@ -665,14 +668,50 @@ def wait_for_pods(timeout: int = 900, on_line=None) -> subprocess.CompletedProce
                    f"--timeout={timeout}s", on_line=on_line, timeout=timeout + 60)
 
 
+# Мониторинг живёт в своём namespace: это единственное, что отличает полный
+# профиль от простого, и удаляется он поэтому целиком, одним именем.
+MONITORING_NS = "monitoring"
+
+
 def apply_monitoring(on_line=None) -> subprocess.CompletedProcess:
-    # Каталогом, а не по файлам: числовой префикс задаёт порядок, а apply -f по
-    # каталогу применяет их в алфавитном порядке — namespace 00 идёт первым.
-    return kubectl("apply", "-f", str(monitoring_dir()), on_line=on_line)
+    # -k, а не -f: мониторингу нужен тот же патч, что и медиастеку.
+    return kubectl("apply", "-k", str(monitoring_dir()), on_line=on_line)
 
 
-def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -> dict:
-    """Полная установка. Возвращает то, что нужно показать человеку."""
+def monitoring_installed() -> bool:
+    """Стоит ли мониторинг на кластере — вопрос к кластеру, а не к state.json.
+
+    Профиль в состоянии говорит, что человек ВЫБРАЛ, а не что развёрнуто. После
+    перехода «полный -> простой» эти два ответа расходятся, и спрашивать нужно
+    именно кластер: иначе окно предложит удалить то, чего нет, или промолчит про
+    то, что осталось работать.
+    """
+    return kubectl("get", "namespace", MONITORING_NS, timeout=60).returncode == 0
+
+
+def remove_monitoring(on_line=None) -> subprocess.CompletedProcess:
+    """Сносит мониторинг целиком, вместе с namespace.
+
+    Namespace отдельный и ничего чужого в нём нет — ни фильмов, ни настроек
+    сервисов, ни тома. Grafana и Prometheus держат данные в emptyDir, то есть
+    теряют их и при обычном перезапуске: удалять тут нечего, кроме самих
+    графиков за последние часы.
+    """
+    if on_line:
+        on_line("Удаляю мониторинг: выбран простой профиль")
+    return kubectl("delete", "namespace", MONITORING_NS, "--ignore-not-found",
+                   "--timeout=180s", on_line=on_line, timeout=240)
+
+
+def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
+            drop_monitoring: bool = False) -> dict:
+    """Полная установка. Возвращает то, что нужно показать человеку.
+
+    drop_monitoring ставит окно, когда человек переключился с полного профиля на
+    простой и подтвердил удаление. Само по себе install этого не решает: удаление
+    — потеря, пусть и небольшая, и спрашивать о ней надо до начала работы, а не
+    посреди неё из фонового потока.
+    """
     prepare_dirs(config_dir, media_dir)
     # Состояние пишем ДО запуска: по нему чинится неудачная установка кнопкой
     # «перепроверить и починить», когда что-то не поднялось с первого раза.
@@ -698,7 +737,16 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None) -
         # Заявки создаёт apply_stack, поэтому ждать связывания можно только здесь.
         wait_for_volumes(on_line=on_line)
         if config.PROFILE_BY_KEY[profile_key].with_monitoring:
-            result = apply_monitoring(on_line)
+            # Намеренно НЕ присваиваем в result. Мониторинг — добавка, и его
+            # неудача не должна отменять главное. Раньше присваивали, и один
+            # занятый порт под Grafana обрывал установку до связывания
+            # сервисов: медиасервер оставался несвязанным из-за графиков.
+            graphs = apply_monitoring(on_line)
+            if graphs.returncode != 0 and on_line:
+                on_line("Графики поставить не вышло — остальное это не задевает. "
+                        f"Что ответил кластер: {graphs.stdout.strip()[-300:]}")
+        elif drop_monitoring:
+            remove_monitoring(on_line)
 
     # Пароль пишем только когда он только что родился: при повторной установке
     # create_qbittorrent_secret вернёт None, и затирать сохранённый было бы потерей.
@@ -842,7 +890,12 @@ def _ports_check() -> Check:
     только что заработало. Поэтому у занятого порта спрашиваем, кто там:
     отвечает по этому адресу наш сервис или посторонняя программа.
     """
-    busy = [s for s in config.SERVICES if _port_busy(s.port)]
+    # Grafana нужна только полному профилю, но порт проверяем всегда: k3s ставит
+    # рядом свой Traefik и занимает под него два случайных порта из того же
+    # диапазона. Пока Grafana сюда не входила, такое совпадение не ловилось
+    # ничем — Service просто не создавался, и человек оставался без графиков,
+    # не понимая почему.
+    busy = [s for s in (*config.SERVICES, config.GRAFANA) if _port_busy(s.port)]
     if not busy:
         return Check(True, "Свободные порты", "все нужные порты свободны")
 

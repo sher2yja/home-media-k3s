@@ -320,9 +320,40 @@ class App(tk.Tk):
                 "Пока не всё готово",
                 "\n\n".join(f"{c.title}: {c.detail}\n{c.fix}" for c in failures))
             return
+        drop_monitoring = self._ask_drop_monitoring(profile)
+        if drop_monitoring is None:
+            return
         self.run_bg(
-            lambda log: install.install(profile, config_dir, media_dir, on_line=log),
+            lambda log: install.install(profile, config_dir, media_dir, on_line=log,
+                                        drop_monitoring=drop_monitoring),
             self._install_done)
+
+    def _ask_drop_monitoring(self, profile_key: str) -> bool | None:
+        """Спрашивает про мониторинг при переходе на простой профиль.
+
+        None значит «человек передумал ставить вообще». Спрашиваем до начала
+        работы и в потоке окна: из фонового потока messagebox показывать нельзя,
+        а молча снести то, что человек включал осознанно, — тем более.
+
+        Вопрос задаётся по состоянию КЛАСТЕРА, а не по записи в state.json:
+        именно расхождение между ними и было дефектом — профиль переключался, а
+        мониторинг оставался работать и есть память.
+        """
+        if config.PROFILE_BY_KEY[profile_key].with_monitoring:
+            return False
+        if not install.monitoring_installed():
+            return False
+        answer = messagebox.askyesnocancel(
+            "Убрать графики?",
+            "Сейчас установлен полный профиль, и вы выбрали простой.\n\n"
+            "Страница с графиками (Grafana) будет удалена, вместе с ней "
+            "освободится около 500 МБ памяти. Фильмы, настройки сервисов и "
+            "пароль торрента не тронутся.\n\n"
+            "«Да» — удалить графики и поставить простой профиль.\n"
+            "«Нет» — оставить графики работать, профиль всё равно станет "
+            "простым.\n"
+            "«Отмена» — ничего не делать.")
+        return None if answer is None else bool(answer)
 
     def _offer_migration(self, config_dir: Path, media_dir: Path) -> bool:
         """Папки меняют уже после установки. Возвращает True, если взяли работу на себя.

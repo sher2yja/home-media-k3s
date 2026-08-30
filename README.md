@@ -112,6 +112,7 @@ Radarr и Prowlarr ничего друг о друге не знают: торр
 | [`k8s/media-stack/`](k8s/media-stack/) | манифесты семи сервисов — общая часть обеих форм |
 | [`k8s/monitoring/`](k8s/monitoring/) | Prometheus, Grafana, node-exporter: профиль «полный» |
 | [`deploy/k3s/`](deploy/k3s/) | оверлей и шаблон томов для машины пользователя |
+| [`deploy/k3s/monitoring/`](deploy/k3s/monitoring/) | оверлей мониторинга: снимает `nodeSelector` стенда |
 | [`ansible/`](ansible/) | разворачивание стенда: виртуальные машины, кластер, NFS |
 | [`infra/vms/scripts/`](infra/vms/scripts/) | проверки стенда на bash, с негативными тестами |
 | [`.github/workflows/`](.github/workflows/) | проверки, сборка, e2e на живом k3s, релизы |

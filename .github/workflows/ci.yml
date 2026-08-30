@@ -147,6 +147,56 @@ jobs:
               f"порт FlareSolverr разошёлся с app/config.py: "
               f"{fs[0]['spec']['ports'][0]['port']} != {config.FLARESOLVERR_PORT}")
           print(f'FlareSolverr: ClusterIP на {config.FLARESOLVERR_PORT}, как в app/config.py')
+
+          # Grafana в оверлей не входит — она в k8s/monitoring и только в полном
+          # профиле, — но её порт записан в двух местах ровно так же. Пока это
+          # никем не сверялось, разойтись было нечему помешать.
+          monitoring = yaml.safe_load_all(
+              open('k8s/monitoring/30-grafana.yaml').read())
+          svc = [d for d in monitoring
+                 if d and d['kind'] == 'Service' and d['metadata']['name'] == 'grafana']
+          assert len(svc) == 1, 'сервиса grafana нет в k8s/monitoring'
+          port = svc[0]['spec']['ports'][0]
+          assert port['nodePort'] == config.GRAFANA.port, (
+              f"порт Grafana разошёлся с app/config.py: "
+              f"{port['nodePort']} != {config.GRAFANA.port}")
+          assert port['port'] == config.GRAFANA.internal_port, (
+              f"внутренний порт Grafana разошёлся: "
+              f"{port['port']} != {config.GRAFANA.internal_port}")
+          print(f'Grafana: {config.GRAFANA.port} -> {config.GRAFANA.internal_port}, '
+                'как в app/config.py')
+
+          # UID дашборда записан и в манифесте, и в config — из него собирается
+          # адрес кнопки. Разойдутся — Grafana ответит страницей «Dashboard not
+          # found», то есть кнопка будет выглядеть рабочей и вести в никуда.
+          import json
+          docs = [d for d in yaml.safe_load_all(
+              open('k8s/monitoring/40-dashboard.yaml').read()) if d]
+          cm = [d for d in docs if d['metadata']['name'] == 'grafana-dashboards'][0]
+          dash = json.loads(cm['data']['home-media.json'])
+          assert dash['uid'] == config.GRAFANA_DASHBOARD_UID, (
+              f"UID дашборда разошёлся: {dash['uid']} != "
+              f"{config.GRAFANA_DASHBOARD_UID}")
+          assert config.GRAFANA_DASHBOARD_UID in config.grafana_dashboard_url()
+          assert dash['panels'], 'в дашборде нет ни одной панели'
+          # Пустой datasource у панели — та же беда: график молча не рисуется.
+          for panel in dash['panels']:
+              uid = panel.get('datasource', {}).get('uid')
+              assert uid == 'prometheus', f"{panel['title']}: datasource {uid!r}"
+          print(f"дашборд {dash['uid']}: панелей {len(dash['panels'])}, "
+                'все на datasource prometheus')
+
+          # Состав оверлея мониторинга должен покрывать всю базу: файл, забытый в
+          # kustomization, просто не поедет к пользователю, и молча.
+          import pathlib
+          base = pathlib.Path('k8s/monitoring')
+          listed = set(yaml.safe_load(
+              (base / 'kustomization.yaml').read_text())['resources'])
+          on_disk = {f.name for f in base.glob('*.yaml')} - {'kustomization.yaml'}
+          assert listed == on_disk, (
+              f'k8s/monitoring/kustomization.yaml разошёлся с каталогом: '
+              f'{on_disk - listed} не перечислены, {listed - on_disk} лишние')
+          print(f'мониторинг: все {len(on_disk)} манифестов перечислены')
           PY
 
       # e2e ставит k3s сам через curl, поэтому скачивание установщика ИЗ

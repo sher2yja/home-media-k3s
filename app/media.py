@@ -88,7 +88,11 @@ def service_status(host: str = "localhost") -> list[dict]:
             "key": s.key,
             "title": s.title,
             "blurb": s.blurb,
-            "url": config.service_url(s, host),
+            # У Grafana адрес особый: главная у неё пустая, и кнопка обязана
+            # вести сразу на готовый дашборд. Иначе человек, включивший полный
+            # профиль ради графиков, попадает на страницу без единого графика.
+            "url": (config.grafana_dashboard_url(host) if s is config.GRAFANA
+                    else config.service_url(s, host)),
             "user_facing": s.user_facing,
             "alive": alive,
             "text": "работает" if alive else "не отвечает",

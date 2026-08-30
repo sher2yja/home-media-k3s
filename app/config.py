@@ -84,10 +84,16 @@ SERVICES: tuple[Service, ...] = (
 )
 
 # Grafana идёт только в профиле «полный», поэтому она вне основного списка.
+#
+# 30030, а не 30300: k3s ставит рядом свой Traefik и занимает под него два
+# СЛУЧАЙНЫХ порта из диапазона NodePort. На машине, где это писалось, один из
+# них оказался ровно 30300 — Service Grafana не создавался вовсе, а установка
+# полного профиля обрывалась до связывания сервисов. Гарантии тут нет ни у
+# одного номера, поэтому занятость этого порта теперь проверяется до установки.
 GRAFANA = Service(
     key="grafana",
     title="Grafana",
-    port=30300,
+    port=30030,
     internal_port=3000,
     blurb="Графики: сколько занято памяти и места на диске.",
     user_facing=False,
@@ -192,6 +198,23 @@ def default_media_dir() -> Path:
 
 def service_url(service: Service, host: str = "localhost") -> str:
     return f"http://{host}:{service.port}"
+
+
+# UID дашборда закреплён в k8s/monitoring/40-dashboard.yaml. Здесь он повторён,
+# потому что из него собирается адрес кнопки, и это второе место — единственное.
+# Расхождение проверяет CI: Grafana на неизвестный UID отвечает не ошибкой, а
+# страницей «Dashboard not found», то есть сломанная кнопка выглядела бы рабочей.
+GRAFANA_DASHBOARD_UID = "home-media"
+
+
+def grafana_dashboard_url(host: str = "localhost") -> str:
+    """Адрес готового дашборда, а не главной Grafana.
+
+    Главная у свежей Grafana пустая, и человек, поставивший полный профиль ради
+    графиков, попадал бы именно на неё.
+    """
+    return (f"{service_url(GRAFANA, host)}/d/{GRAFANA_DASHBOARD_UID}"
+            "/domashnij-mediaserver")
 
 
 # --- Состояние установки ----------------------------------------------------
