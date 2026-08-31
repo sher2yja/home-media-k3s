@@ -30,7 +30,8 @@ python3 app/main.py
 
 ```bash
 cd app && python3 media.py      # разбор очередей *arr и статусов Jellyseerr
-cd app && python3 install.py    # шаблон томов, пункт меню, перенос со ссылками
+cd app && python3 install.py    # шаблон томов, пункт меню, перенос со ссылками,
+                                # ожидание узла (kubectl и sleep подменены)
 cd app && python3 wire.py       # подстановка полей в схему настроек, разбор причины отказа
 cd app && python3 icon.py       # кодирование PNG без сторонних библиотек
 cd app && python3 guides.py     # состав подвкладок и подстановка портов из config
@@ -361,8 +362,8 @@ pyinstaller --clean --noconfirm home-media-k3s.spec
 
 | Задача | Когда | Что делает |
 |---|---|---|
-| `check` | всегда | линтер, самопроверки, YAML, bash+shellcheck, сборка оверлея, сверка портов, сборка окна под xvfb |
-| `e2e` | `master` и теги | ставит настоящий k3s, гоняет `install.install()` — тот же код, что у пользователя, — и опрашивает сервисы через `media.service_status()` |
+| `check` | всегда | линтер, самопроверки, YAML, bash+shellcheck, сборка оверлея, сверка портов с манифестами и с текстами, запрет на вернувшиеся слова и захардкоженный логин, правила показа кнопки на графики, сборка окна под xvfb |
+| `e2e` | `master` и теги | ставит настоящий k3s флагами из `install.K3S_EXEC`, гоняет `install.install()` — тот же код, что у пользователя, — опрашивает сервисы через `media.service_status()`, проверяет, что Traefik не развернулся, и меняет логин с паролем торрента во всех трёх местах |
 | `build` | всегда | PyInstaller, артефакт `home-media-k3s-linux` |
 | `release` | теги `v*` | выкладывает артефакты `build` в GitHub Release без пересборки |
 

@@ -146,6 +146,30 @@ jobs:
           print('полный профиль + Grafana молчит    -> строка с крестиком')
           PY
 
+      # Порт Grafana переехал с 30300 на 30030, манифесты и app/config.py поправились
+      # вместе, а схема в README осталась со старым номером и пережила несколько
+      # прогонов: сверка портов смотрела на манифесты, до текстов не доходила.
+      - name: Порты в README и MANUAL совпадают с app/config.py
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          sys.path.insert(0, 'app')
+          import config
+
+          known = {s.port for s in (*config.SERVICES, config.GRAFANA)}
+          bad = []
+          for name in ('README.md', 'MANUAL.md'):
+              for n, line in enumerate(pathlib.Path(name).read_text().splitlines(), 1):
+                  for found in re.findall(r'\b3[0-9]{4}\b', line):
+                      if int(found) not in known:
+                          bad.append(f'{name}:{n}: порт {found} — такого нет в config.py')
+          if bad:
+              print('\n'.join(bad), file=sys.stderr)
+              print('порты в config.py:', sorted(known), file=sys.stderr)
+              sys.exit(1)
+          print('порты в текстах совпадают с таблицей:', sorted(known))
+          PY
+
       - name: Синтаксис YAML
         run: |
           python - <<'PY'
