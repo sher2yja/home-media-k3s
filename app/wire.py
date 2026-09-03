@@ -475,6 +475,21 @@ def link_prowlarr(prowlarr_key: str, key: str, api_key: str) -> Step:
             else _failed(title, code, reason))
 
 
+def sync_indexers(prowlarr_key: str) -> Step:
+    """Повторно раздаёт индексеры уже связанным Sonarr и Radarr.
+
+    Сама связка может существовать, пока индексер временно недоступен. Тогда
+    Prowlarr не создаёт его в приложениях, а link_prowlarr при следующем запуске
+    справедливо видит готовую связку и ничего не меняет. Явная синхронизация
+    закрывает именно этот повторный сценарий.
+    """
+    title = "Индексеры в Sonarr и Radarr"
+    code, _, reason = _api("prowlarr", prowlarr_key, "/api/v1/command",
+                           data={"name": "ApplicationIndexerSync"})
+    return (Step(title, True, "повторная синхронизация запущена")
+            if code in (200, 201, 202) else _failed(title, code, reason))
+
+
 # --- Всё вместе -------------------------------------------------------------
 
 def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
@@ -526,6 +541,8 @@ def configure(config_dir: Path | None = None, on_line=None) -> list[Step]:
         log(enable_hardlinks(service, keys[service]))
         if keys.get("prowlarr"):
             log(link_prowlarr(keys["prowlarr"], service, keys[service]))
+    if keys.get("prowlarr") and (keys.get("sonarr") or keys.get("radarr")):
+        log(sync_indexers(keys["prowlarr"]))
     return steps
 
 
