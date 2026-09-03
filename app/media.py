@@ -87,7 +87,6 @@ def service_status(host: str = "localhost") -> list[dict]:
     """Статус для показа человеку. Намеренно не «pod Running» и не код ответа:
     вопрос, на который отвечает эта страница, — «работает или нет»."""
     out = []
-    browser_host = config.browser_host() if host == "localhost" else host
     state = config.load_state()
     services = list(config.SERVICES)
     profile = config.PROFILE_BY_KEY.get(state.get("profile", ""))
@@ -108,8 +107,8 @@ def service_status(host: str = "localhost") -> list[dict]:
             # У Grafana адрес особый: главная у неё пустая, и кнопка обязана
             # вести сразу на готовый дашборд. Иначе человек, включивший полный
             # профиль ради графиков, попадает на страницу без единого графика.
-            "url": (config.grafana_dashboard_url(browser_host)
-                    if s is config.GRAFANA else config.browser_url(s, browser_host)),
+            "url": (config.grafana_dashboard_url(host) if s is config.GRAFANA
+                    else config.service_url(s, host)),
             "user_facing": s.user_facing,
             "alive": alive,
             "text": "работает" if alive else "не отвечает",

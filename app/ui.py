@@ -175,8 +175,7 @@ class App(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         for button in (self.install_button, self.recheck_button,
-                       self.repair_button, self.wire_button,
-                       self.start_button, self.stop_button):
+                       self.repair_button, self.wire_button):
             button.configure(state=state)
         if busy:
             self.progress.start(12)
@@ -234,22 +233,29 @@ class App(tk.Tk):
         # Пауза — чтобы не пересчитывать на каждую букву при ручном вводе.
         self.media_dir.trace_add("write", self._media_dir_changed)
 
-        creds = ttk.LabelFrame(tab, text="Ваш аккаунт медиатеки", padding=PAD)
+        # Логин и пароль торрента. Пустые поля — прежнее поведение: программа
+        # придумает пароль сама и покажет его в конце. Заполнять их незачем
+        # почти никому, поэтому они и стоят ниже папок и подписаны как
+        # необязательные, а не встречают человека первым делом.
+        creds = ttk.LabelFrame(tab, text="Логин и пароль торрента (необязательно)",
+                               padding=PAD)
         creds.pack(fill="x", pady=(PAD, 0))
         ttk.Label(creds, foreground="#555", wraplength=720, text=(
-            "Этими данными вы будете входить в Jellyfin и Jellyseerr. Остальные "
-            "сервисы приложение настроит само; их технические пароли вводить не нужно."
+            "Оставьте пустыми — программа придумает пароль сама и покажет его в "
+            "конце установки. Заполните, если хотите свои. Только латинские "
+            "буквы, цифры и знаки: русские буквы qBittorrent примет, а Sonarr и "
+            "Radarr после этого перестанут к нему подключаться."
         )).pack(anchor="w", pady=(0, 6))
         row = ttk.Frame(creds)
         row.pack(fill="x")
         ttk.Label(row, text="Логин").pack(side="left")
-        self.media_login = tk.StringVar(value=config.load_state().get("media_login", ""))
-        ttk.Entry(row, textvariable=self.media_login, width=18).pack(
-            side="left", padx=(6, 16))
+        self.qbt_login = tk.StringVar()
+        ttk.Entry(row, textvariable=self.qbt_login, width=18).pack(side="left",
+                                                                  padx=(6, 16))
         ttk.Label(row, text="Пароль").pack(side="left")
-        self.media_password = tk.StringVar()
-        ttk.Entry(row, textvariable=self.media_password, show="•", width=24).pack(
-            side="left", padx=(6, 0))
+        self.qbt_password = tk.StringVar()
+        ttk.Entry(row, textvariable=self.qbt_password, width=24).pack(side="left",
+                                                                     padx=(6, 0))
 
         self.install_button = ttk.Button(tab, text="Установить", command=self.do_install)
         self.install_button.pack(anchor="w", pady=PAD)
@@ -338,22 +344,19 @@ class App(tk.Tk):
                 "Пока не всё готово",
                 "\n\n".join(f"{c.title}: {c.detail}\n{c.fix}" for c in failures))
             return
-        login, password = self.media_login.get().strip(), self.media_password.get()
-        if not login or not password:
-            messagebox.showwarning("Нужен аккаунт",
-                                   "Введите логин и пароль для Jellyfin и Jellyseerr.")
-            return
-        if len(password) < 6:
-            messagebox.showwarning("Слишком короткий пароль",
-                                   "Пароль должен быть не короче 6 символов.")
-            return
+        login, password = self.qbt_login.get().strip(), self.qbt_password.get()
+        if login or password:
+            problem = wire.check_credentials(login, password)
+            if problem:
+                messagebox.showwarning("Логин и пароль торрента", problem)
+                return
         drop_monitoring = self._ask_drop_monitoring(profile)
         if drop_monitoring is None:
             return
         self.run_bg(
             lambda log: install.install(profile, config_dir, media_dir, on_line=log,
                                         drop_monitoring=drop_monitoring,
-                                        media_login=login, media_password=password),
+                                        qbt_login=login, qbt_password=password),
             self._install_done)
 
     def _ask_drop_monitoring(self, profile_key: str) -> bool | None:
@@ -446,13 +449,9 @@ class App(tk.Tk):
                 "Кластер сообщил вот что. Если ничего не понятно — это нормально, "
                 "покажите текст из окна ниже тому, кто ставил вам систему.")
             return
-        failed = [step for step in result.get("steps", []) if not step.ok]
-        if failed:
-            messagebox.showwarning(
-                "Установлено, но настроено не всё",
-                "\n\n".join(f"{step.title}: {step.detail}" for step in failed)
-                + "\n\nВведите тот же логин и пароль и нажмите «Установить» ещё раз.")
-        self.media_password.set("")
+        password = result.get("qbittorrent_password")
+        if password:
+            self._password_dialog(password)
         self.notebook.select(1)
         self.refresh_dashboard()
 
@@ -501,12 +500,16 @@ class App(tk.Tk):
 
         ttk.Label(tab, text="Ваш медиасервер",
                   font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
-        # Единственное ручное место — выбор индексаторов: у них бывают внешние
-        # регистрации и ключи. Аккаунт и связи внутри стека создаются установщиком.
+        # Надпись говорит правду, а не «настройте все шесть»: три сервиса
+        # настраивает wire.configure, и человек, пошедший искать в них настройки,
+        # потратит время впустую. Список берётся из guides.NEEDS_SETUP, чтобы не
+        # разъехаться с подвкладками.
         need = ", ".join(config.BY_KEY[k].title for k in guides.NEEDS_SETUP)
         ttk.Label(tab, foreground="#555", wraplength=760, text=(
-            f"Приложение уже создало единый вход и связало сервисы. Вручную "
-            f"остаётся только {need}: выберите сайты, на которых искать раздачи.\n"
+            f"Три сервера нужно настроить самому — {need}: в них нужен ваш "
+            "выбор, и за вас его никто не сделает. Откройте подвкладку и следуйте "
+            "инструкции. Остальные программа настроила сама; их подвкладки нужны, "
+            "только если захотите проверить.\n"
             "Всё это работает на этом компьютере — пока он включён."
         )).pack(anchor="w", pady=(0, PAD))
 
@@ -535,19 +538,12 @@ class App(tk.Tk):
         self.repair_button = ttk.Button(buttons, text="Перепроверить и починить",
                                         command=self.do_repair)
         self.repair_button.pack(side="left", padx=(6, 0))
-        self.start_button = ttk.Button(buttons, text="Запустить",
-                                       command=self.do_start_media_server)
-        self.start_button.pack(side="left", padx=(6, 0))
-        self.stop_button = ttk.Button(buttons, text="Остановить",
-                                      command=self.do_stop_media_server)
-        self.stop_button.pack(side="left", padx=(6, 0))
         ttk.Label(tab, foreground="#555", wraplength=740, text=(
             "«Связать сервисы» — рассказывает сервисам друг о друге: поиск, торрент, "
             "куда складывать готовое. Делается при установке само, кнопка нужна, "
             "если что-то не успело подняться или если вы добавили сайт в Prowlarr.\n"
             "«Перепроверить и починить» возвращает сервисы к правильным настройкам. "
-            "Фильмы и настройки при этом не пропадают. «Остановить» выключает "
-            "контейнеры, но сохраняет данные; «Запустить» возвращает их обратно."
+            "Фильмы и настройки при этом не пропадают."
         )).pack(anchor="w")
 
     def _build_guide_subtab(self, key: str) -> None:
@@ -560,7 +556,7 @@ class App(tk.Tk):
         buttons = ttk.Frame(tab)
         buttons.pack(fill="x", pady=(PAD, 0))
         ttk.Button(buttons, text=f"Открыть {service.title}",
-                   command=lambda s=service: webbrowser.open(config.browser_url(s))
+                   command=lambda s=service: webbrowser.open(config.service_url(s))
                    ).pack(side="left")
         if key == "qbittorrent":
             ttk.Button(buttons, text="Сменить логин и пароль",
@@ -701,25 +697,6 @@ class App(tk.Tk):
         self.notebook.select(0)   # лог живёт на первой вкладке — переключаемся к нему
         self.run_bg(lambda log: install.repair(on_line=log), self._repair_done)
 
-    def do_stop_media_server(self) -> None:
-        self.notebook.select(0)
-        self.run_bg(lambda log: install.stop_media_server(on_line=log),
-                    lambda result: self._media_power_done(result, running=False))
-
-    def do_start_media_server(self) -> None:
-        self.notebook.select(0)
-        self.run_bg(lambda log: install.start_media_server(on_line=log),
-                    lambda result: self._media_power_done(result, running=True))
-
-    def _media_power_done(self, result, *, running: bool) -> None:
-        if isinstance(result, Exception):
-            messagebox.showerror("Не получилось", str(result))
-            return
-        messagebox.showinfo("Готово", "Медиасервер запущен" if running
-                            else "Медиасервер остановлен; данные сохранены")
-        self.notebook.select(1)
-        self.refresh_dashboard()
-
     def _repair_done(self, result) -> None:
         if isinstance(result, Exception):
             messagebox.showerror("Не получилось", str(result))
@@ -747,7 +724,7 @@ class App(tk.Tk):
             "свои заказы. Отдельной учётной записи здесь нет: аккаунты живут в "
             "Jellyfin, программа просто спрашивает у него."
         )).pack(anchor="w", pady=(0, 6))
-        self.jf_login = tk.StringVar(value=config.load_state().get("media_login", ""))
+        self.jf_login = tk.StringVar()
         self.jf_password = tk.StringVar()
         form = ttk.Frame(self.login_frame)
         form.pack(anchor="w")
@@ -854,7 +831,7 @@ class App(tk.Tk):
                         "если вы полезете в настройки qBittorrent сами."), ""]
         if profile and profile.with_monitoring:
             blocks += ["ГРАФИКИ НАГРУЗКИ",
-                       f"Grafana: {config.browser_url(config.GRAFANA)}",
+                       f"Grafana: {config.service_url(config.GRAFANA)}",
                        config.GRAFANA.blurb, ""]
         blocks += [
             "=" * 60,
