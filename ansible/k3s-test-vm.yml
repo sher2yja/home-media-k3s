@@ -1,0 +1,42 @@
+---
+- name: Создать отдельную VM для проверки пользовательской установки
+  hosts: libvirt_host
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    vms:
+      - name: home-media-k3s-test
+        mac: "52:54:00:12:34:04"
+        ip: 192.168.122.14
+        memory: 4096
+        vcpus: 2
+        disk: 40G
+        extra_disk: false
+  pre_tasks:
+    - name: Состояние уже созданной тестовой VM
+      ansible.builtin.command: virsh domstate home-media-k3s-test
+      register: k3s_test_vm_state
+      changed_when: false
+      failed_when: false
+
+    - name: Запустить ранее остановленную тестовую VM
+      ansible.builtin.command: virsh start home-media-k3s-test
+      when:
+        - k3s_test_vm_state.rc == 0
+        - k3s_test_vm_state.stdout | trim != "running"
+  roles:
+    - libvirt_vms
+
+- name: Подготовить графический запуск приложения внутри VM
+  hosts: k3s_test
+  become: true
+  tasks:
+    - name: Дождаться завершения cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+
+    - name: Установить только зависимости окна и запроса прав
+      ansible.builtin.apt:
+        name: [python3-tk, xauth, dbus-x11, lxqt-policykit, rsync]
+        state: present
+        update_cache: true

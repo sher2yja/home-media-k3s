@@ -180,6 +180,169 @@ def update_download_client(key: str, api_key: str, password: str) -> Step:
             if code in (200, 201, 202) else _failed(title, code, reason))
 
 
+# --- Один пользовательский аккаунт ----------------------------------------
+
+def jellyseerr_login_payload(login: str, password: str) -> dict:
+    return {"username": login, "password": password, "hostname": "jellyfin",
+            "port": config.BY_KEY["jellyfin"].internal_port, "useSsl": False,
+            "urlBase": "", "serverType": 2}
+
+
+def jellyseerr_arr_payload(key: str, api_key: str, profile_id: int,
+                           profile_name: str) -> dict:
+    service = config.BY_KEY[key]
+    payload = {
+        "name": service.title, "hostname": key, "port": service.internal_port,
+        "apiKey": api_key, "useSsl": False, "baseUrl": "",
+        "activeProfileId": profile_id, "activeProfileName": profile_name,
+        "activeDirectory": config.ROOT_FOLDERS[key], "tags": [], "is4k": False,
+        "isDefault": True, "syncEnabled": False, "preventSearch": False,
+        "tagRequests": False,
+    }
+    if key == "sonarr":
+        payload |= {"seriesType": "standard", "animeTags": [],
+                    "enableSeasonFolders": True}
+    else:
+        payload["minimumAvailability"] = "released"
+    return payload
+
+
+def _jellyfin(path: str, *, data=None, token: str = "", method: str | None = None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Emby-Token"] = token
+    body = json.dumps(data).encode() if data is not None else None
+    code, raw = media._request(
+        config.service_url(config.BY_KEY["jellyfin"]) + path,
+        headers=headers, data=body, method=method)
+    try:
+        return code, json.loads(raw) if raw else None
+    except ValueError:
+        return code, None
+
+
+def configure_jellyfin_account(login: str, password: str) -> tuple[Step, str | None]:
+    title = "Аккаунт Jellyfin"
+    code, info = _jellyfin("/System/Info/Public")
+    if code != 200:
+        return Step(title, False, f"сервис ответил {code}"), None
+    if not info.get("StartupWizardCompleted", False):
+        requests = (
+            ("/Startup/Configuration", {"ServerName": "Домашний медиасервер",
+             "UICulture": "ru", "MetadataCountryCode": "RU",
+             "PreferredMetadataLanguage": "ru"}),
+            ("/Startup/User", {"Name": login, "Password": password}),
+            ("/Startup/RemoteAccess", {"EnableRemoteAccess": True,
+             "EnableAutomaticPortMapping": False}),
+            ("/Startup/Complete", {}),
+        )
+        for path, payload in requests:
+            code, _ = _jellyfin(path, data=payload)
+            if code not in (200, 204):
+                return Step(title, False, f"первичная настройка ответила {code}"), None
+    who = media.jellyfin_login(login, password)
+    if not who or not who.get("token"):
+        return Step(title, False, "Jellyfin не принял логин или пароль"), None
+    token = who["token"]
+    code, folders = _jellyfin("/Library/VirtualFolders", token=token)
+    if code != 200:
+        return Step(title, False, f"список медиатек ответил {code}"), None
+    existing = {x.get("CollectionType") for x in folders or []}
+    for name, kind, path in (("Фильмы", "movies", config.ROOT_FOLDERS["radarr"]),
+                             ("Сериалы", "tvshows", config.ROOT_FOLDERS["sonarr"])):
+        if kind in existing:
+            continue
+        query = urllib.parse.urlencode({"name": name, "collectionType": kind,
+                                        "paths": path, "refreshLibrary": "true"})
+        code, _ = _jellyfin(f"/Library/VirtualFolders?{query}", data={},
+                            token=token)
+        if code not in (200, 204):
+            return Step(title, False, f"медиатека {name} ответила {code}"), None
+    return Step(title, True, "создан; медиатеки подключены"), token
+
+
+class _Jellyseerr:
+    def __init__(self) -> None:
+        self.base = config.service_url(config.BY_KEY["jellyseerr"]) + "/api/v1"
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+
+    def request(self, path: str, *, data=None, method: str | None = None):
+        body = json.dumps(data).encode() if data is not None else None
+        req = urllib.request.Request(self.base + path, data=body, method=method,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with self.opener.open(req, timeout=media.TIMEOUT) as response:
+                raw = response.read()
+                return response.status, json.loads(raw) if raw else None
+        except urllib.error.HTTPError as error:
+            return error.code, None
+
+
+def configure_jellyseerr(config_dir: Path, login: str, password: str) -> Step:
+    title = "Аккаунт и серверы Jellyseerr"
+    client = _Jellyseerr()
+    payload = jellyseerr_login_payload(login, password)
+    code, _ = client.request("/auth/jellyfin", data=payload)
+    if code != 200:
+        # После первой настройки hostname уже сохранён и повторно запрещён.
+        payload.pop("hostname")
+        payload.pop("port")
+        payload.pop("useSsl")
+        payload.pop("urlBase")
+        payload.pop("serverType")
+        code, _ = client.request("/auth/jellyfin", data=payload)
+    if code != 200:
+        return Step(title, False, f"вход через Jellyfin ответил {code}")
+
+    for key in ("sonarr", "radarr"):
+        api_key = media.arr_api_key(config_dir, key)
+        code, current = client.request(f"/settings/{key}")
+        if code != 200:
+            return Step(title, False, f"настройки {key} ответили {code}")
+        if any(item.get("hostname") == key for item in current or []):
+            continue
+        _, profiles, _ = _api(key, api_key, "/api/v3/qualityprofile")
+        profile = next((p for p in profiles or [] if p.get("name") == "Any"),
+                       (profiles or [None])[0])
+        if not profile:
+            return Step(title, False, f"{key} не отдал профиль качества")
+        server = jellyseerr_arr_payload(key, api_key, profile["id"], profile["name"])
+        code, _ = client.request(f"/settings/{key}", data=server)
+        if code not in (200, 201):
+            return Step(title, False, f"подключение {key} ответило {code}")
+
+    libraries = None
+    for _ in range(10):
+        code, libraries = client.request("/settings/jellyfin/library?sync=true")
+        if code == 200 and libraries:
+            break
+        time.sleep(2)
+    if not libraries:
+        return Step(title, False, "Jellyseerr не увидел медиатеки Jellyfin")
+    enabled = ",".join(x["id"] for x in libraries)
+    code, _ = client.request(
+        "/settings/jellyfin/library?" + urllib.parse.urlencode({"enable": enabled}))
+    if code != 200:
+        return Step(title, False, f"включение медиатек ответило {code}")
+    code, _ = client.request("/settings/initialize", data={})
+    return (Step(title, True, "единый вход и серверы настроены") if code == 200
+            else Step(title, False, f"завершение настройки ответило {code}"))
+
+
+def configure_account(config_dir: Path, login: str, password: str,
+                      on_line=None) -> list[Step]:
+    jellyfin, _ = configure_jellyfin_account(login, password)
+    steps = [jellyfin]
+    if jellyfin.ok:
+        steps.append(configure_jellyseerr(config_dir, login, password))
+    if on_line:
+        for step in steps:
+            on_line(f"{'✓' if step.ok else '✕'} {step.title}: {step.detail}")
+    return steps
+
+
 # Метка, которой помечается прокси. Без неё Prowlarr его просто не применяет —
 # см. add_flaresolverr, там же измерения.
 FLARESOLVERR_TAG = "flaresolverr"
@@ -560,6 +723,18 @@ def _self_check() -> None:
     assert config.internal_url("qbittorrent") == "http://qbittorrent:8080"
     assert config.ROOT_FOLDERS["sonarr"].startswith(config.DATA_MOUNT)
     assert set(SYNC_CATEGORIES) == {"sonarr", "radarr"}
+
+    # Один пользовательский логин на входе превращается в настройки Jellyseerr;
+    # технические ключи и внутренние адреса пользователь не вводит.
+    account = jellyseerr_login_payload("alex", "secret-pass")
+    assert account == {
+        "username": "alex", "password": "secret-pass", "hostname": "jellyfin",
+        "port": 8096, "useSsl": False, "urlBase": "", "serverType": 2,
+    }
+    server = jellyseerr_arr_payload("sonarr", "API", 7, "HD-1080p")
+    assert server["hostname"] == "sonarr" and server["port"] == 8989
+    assert server["activeProfileId"] == 7 and server["isDefault"] is True
+    assert server["activeDirectory"] == "/data/library/tv"
     print("wire.py self-check: OK")
 
 

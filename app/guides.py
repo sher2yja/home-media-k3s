@@ -9,10 +9,9 @@
 сервисов. Иначе получилось бы второе место, где записаны номера портов, — и оно
 разошлось бы с первым, как уже расходилось.
 
-Всё, что человек делает сам, собрано в три сервиса: Jellyfin (учётная запись и
-медиатеки), Prowlarr (где искать) и Jellyseerr (мастер). Остальные три
-настраивает wire.configure, и их инструкция — объяснение, что именно уже сделано
-и куда идти, если там всё-таки видно предупреждение.
+Единственный ручной выбор — индексаторы в Prowlarr: внешние сайты могут требовать
+собственную регистрацию. Аккаунт Jellyfin, медиатеки, Jellyseerr и внутренние
+связи создаёт приложение.
 """
 
 import config
@@ -21,22 +20,20 @@ import config
 # котором это делается. SERVICES для этого не годится — он про раскладку окна.
 ORDER = ("jellyfin", "prowlarr", "jellyseerr", "sonarr", "radarr", "qbittorrent")
 
-# Три сервиса требуют участия человека, три — нет. Это же различие показывается
-# надписью над подвкладками, поэтому список один и тот же.
-NEEDS_SETUP = ("jellyfin", "prowlarr", "jellyseerr")
+# Только внешние сайты требуют участия человека.
+NEEDS_SETUP = ("prowlarr",)
 
 
 def _jellyfin() -> list[str]:
     return [
-        "ЧТО СДЕЛАТЬ: завести себя и показать папки",
+        "УЖЕ НАСТРОЕНО: единый аккаунт и две медиатеки",
         "",
         ("Jellyfin — то, ради чего всё остальное. Здесь вы смотрите фильмы и "
          "сериалы; на него же смотрят приложения на телефоне и телевизоре."),
         "",
-        "1. Нажмите «Открыть Jellyfin» внизу.",
-        ("2. Он попросит придумать логин и пароль. Это ваша учётная запись, ею же "
-         "вы будете входить с других устройств."),
-        "3. Когда спросит про медиатеку, добавьте две:",
+        ("Приложение создало аккаунт из логина и пароля, введённых при установке. "
+         "Эти же данные подходят для Jellyseerr, телефона и телевизора."),
+        "Подключены две папки:",
         f"     «Фильмы»  ->  {config.ROOT_FOLDERS['radarr']}",
         f"     «Сериалы» ->  {config.ROOT_FOLDERS['sonarr']}",
         "",
@@ -89,63 +86,14 @@ def _prowlarr() -> list[str]:
 
 
 def _jellyseerr(keys: dict) -> list[str]:
-    radarr, sonarr = config.BY_KEY["radarr"], config.BY_KEY["sonarr"]
     return [
-        "ЧТО СДЕЛАТЬ: пройти мастер",
+        "УЖЕ НАСТРОЕНО: вход через Jellyfin и серверы загрузки",
         "",
         ("Jellyseerr — окно заказов: здесь вы просите фильм, которого ещё нет. "
-         "Мастер проходится один раз и связывает его с остальными."),
+         "Приложение уже прошло мастер и связало его с остальными сервисами."),
         "",
-        "ШАГ 1. Адрес Jellyfin",
-        "Первым делом мастер спросит, где Jellyfin. Впишите ровно это:",
-        f"     Jellyfin URL:  {config.BY_KEY['jellyfin'].key}",
-        f"     Port:          {config.BY_KEY['jellyfin'].internal_port}",
-        "     URL Base:      оставить пустым",
-        "",
-        ("   В верхнее поле идёт ИМЯ буквами, в нижнее — порт. Вписать номер "
-         "порта в оба — самая частая ошибка: форма зависнет на «Signing In...»."),
-        ("   И не localhost, и не адрес из браузера: Jellyseerr живёт рядом с "
-         "Jellyfin внутри сервера, localhost для него — он сам."),
-        "",
-        "   Логин и пароль — те же, что вы завели в Jellyfin.",
-        "",
-        "ШАГ 2. Экран «Configure Media Server»",
-        ("Нажмите «Sync Libraries», включите обе медиатеки — «Фильмы» и "
-         "«Сериалы» — и нажмите «Start Scan»."),
-        ("   Выключенную медиатеку Jellyseerr не увидит. Скан идёт в фоне, ждать "
-         "его не нужно."),
-        ("   В «Jellyfin Settings» ниже не трогайте ничего: ключ создан сам, "
-         "External URL и Forgot Password URL оставьте пустыми."),
-        ("   Список медиатек пуст даже после «Sync Libraries» — значит они не "
-         "заведены в Jellyfin. Вернитесь на подвкладку Jellyfin."),
-        "",
-        "ШАГ 3. Экран «Configure Services»",
-        "Добавьте два сервера, Radarr и Sonarr. Поля заполняются так:",
-        "",
-        "     Server Name              radarr            sonarr",
-        "     Hostname or IP Address   radarr            sonarr",
-        (f"     Port                     {radarr.internal_port}"
-         f"              {sonarr.internal_port}"),
-        "     Use SSL, URL Base        выключено, пусто",
-        "",
-        "Поле «API Key» пустое, и само оно не заполнится — вставьте ключ отсюда:",
-        f"     Radarr API Key:  {keys.get('radarr') or 'не удалось прочитать'}",
-        f"     Sonarr API Key:  {keys.get('sonarr') or 'не удалось прочитать'}",
-        "",
-        ("   Только ПОСЛЕ ключа жмите «Test»: по нему подтягиваются списки "
-         "«Quality Profile» и «Root Folder». Без ключа они пустые."),
-        "",
-        "   В «Root Folder» выберите ту папку, что уже там есть:",
-        f"     Radarr:  {config.ROOT_FOLDERS['radarr']}",
-        f"     Sonarr:  {config.ROOT_FOLDERS['sonarr']}",
-        "",
-        ("   «Quality Profile» — на ваш вкус, например HD-1080p. Остальные "
-         "переключатели оставьте как есть и нажмите «Add Server»."),
-        "",
-        "ПРОВЕРЬТЕ, ЧТО НЕ ЗАДВОИЛОСЬ",
-        ("Jellyseerr легко принимает Sonarr за второй Radarr — формы у них "
-         "одинаковые, и зелёная кнопка «Test» этого не ловит. Сериалы должны "
-         "быть в разделе Sonarr, фильмы — в Radarr."),
+        "Входите тем же логином и паролем, что указали при установке.",
+        "Фильмы отправляются в Radarr, сериалы — в Sonarr автоматически.",
         "",
         "ЕСЛИ ВМЕСТО СТРАНИЦЫ ФИЛЬМА «500 — Внутренняя ошибка сервера»",
         ("Это не поломка сервера. Названия и обложки Jellyseerr берёт во внешней "
@@ -266,11 +214,9 @@ def _self_check() -> None:
     assert config.ROOT_FOLDERS["radarr"] in jellyfin
     assert str(config.BY_KEY["jellyfin"].port) in jellyfin
 
-    seerr = "\n".join(lines("jellyseerr", {"radarr": "КЛЮЧ-Р", "sonarr": "КЛЮЧ-С"}))
-    assert "КЛЮЧ-Р" in seerr and "КЛЮЧ-С" in seerr
-    assert str(config.BY_KEY["jellyfin"].internal_port) in seerr
-    # Без ключей текст обязан собраться — на чистой машине их ещё нет.
-    assert "не удалось прочитать" in "\n".join(lines("jellyseerr"))
+    seerr = "\n".join(lines("jellyseerr"))
+    assert "тем же логином и паролем" in seerr
+    assert "Radarr" in seerr and "Sonarr" in seerr
 
     torrent = "\n".join(lines("qbittorrent", password="секрет"))
     assert "секрет" in torrent and config.DOWNLOADS_DIR in torrent

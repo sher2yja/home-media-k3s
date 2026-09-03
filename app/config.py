@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -206,6 +208,25 @@ def service_url(service: Service, host: str = "localhost") -> str:
     return f"http://{host}:{service.port}"
 
 
+def browser_host() -> str:
+    """Адрес этой машины для браузера, а не loopback внутри VM."""
+    override = os.environ.get("HOME_MEDIA_HOST")
+    if override:
+        return override
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("1.1.1.1", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return "localhost"
+    finally:
+        sock.close()
+
+
+def browser_url(service: Service, host: str | None = None) -> str:
+    return service_url(service, host or browser_host())
+
+
 # UID дашборда закреплён в k8s/monitoring/40-dashboard.yaml. Здесь он повторён,
 # потому что из него собирается адрес кнопки, и это второе место — единственное.
 # Расхождение проверяет CI: Grafana на неизвестный UID отвечает не ошибкой, а
@@ -271,3 +292,13 @@ def qbittorrent_login() -> str:
     API торрента и в инструкции на экране. Захардкоженный admin там и лежал.
     """
     return load_state().get("qbittorrent_login") or QBT_DEFAULT_LOGIN
+
+
+def _self_check() -> None:
+    assert browser_url(BY_KEY["qbittorrent"], "192.168.122.14") == \
+        "http://192.168.122.14:30880"
+
+
+if __name__ == "__main__":
+    _self_check()
+    print("config.py self-check: OK")

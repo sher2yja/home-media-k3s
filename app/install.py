@@ -367,6 +367,59 @@ def ensure_desktop_entry() -> Path | None:
 QBT_SECRET = "qbittorrent-webui"
 
 
+def sync_qbittorrent_config(config_dir: Path, login: str, password: str) -> bool:
+    """Синхронизирует существующий конфиг с только что созданным Secret.
+
+    Init-контейнер создаёт файл с нуля, но намеренно не перезаписывает прежний.
+    После неудачной установки такой файл уже есть, а Secret ещё нет: без этой
+    синхронизации новый пароль показывается человеку, но qBittorrent его не знает.
+    """
+    path = config_dir / "qbittorrent" / "qBittorrent" / "qBittorrent.conf"
+    if not path.exists():
+        return False
+
+    values = {
+        "WebUI\\Username": login,
+        "WebUI\\Password_PBKDF2": f'"{qbittorrent_pbkdf2(password)}"',
+    }
+    lines = path.read_text(encoding="utf-8").splitlines()
+    found: set[str] = set()
+    for index, line in enumerate(lines):
+        for key, value in values.items():
+            if line.startswith(key + "="):
+                lines[index] = f"{key}={value}"
+                found.add(key)
+
+    missing = [f"{key}={value}" for key, value in values.items() if key not in found]
+    if missing:
+        try:
+            insert_at = lines.index("[Preferences]") + 1
+        except ValueError:
+            lines.extend(["", "[Preferences]"])
+            insert_at = len(lines)
+        lines[insert_at:insert_at] = missing
+
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.chmod(path.stat().st_mode)
+    temporary.replace(path)
+    return True
+
+
+def prepare_qbittorrent_config(config_dir: Path, login: str, password: str,
+                               on_line=None) -> bool:
+    """Останавливает прежний pod до синхронизации, чтобы тот не вернул старый хеш."""
+    path = config_dir / "qbittorrent" / "qBittorrent" / "qBittorrent.conf"
+    if not path.exists():
+        return False
+    kubectl("scale", "deployment/qbittorrent", "-n", "media", "--replicas=0",
+            on_line=on_line, timeout=180)
+    kubectl("wait", "--for=delete", "pod",
+            "-l", "app.kubernetes.io/name=qbittorrent", "-n", "media",
+            "--timeout=180s", on_line=on_line, timeout=240)
+    return sync_qbittorrent_config(config_dir, login, password)
+
+
 def create_qbittorrent_secret(on_line=None, login: str = "",
                               password: str = "") -> str | None:
     """Возвращает новый пароль либо None, если Secret уже был.
@@ -631,6 +684,25 @@ def scale_stack(replicas: int, on_line=None) -> None:
                 "--timeout=180s", on_line=on_line, timeout=240)
 
 
+def stop_media_server(on_line=None) -> None:
+    """Останавливает контейнеры, сохраняя настройки, фильмы, PVC и сам k3s."""
+    if not k3s_installed():
+        raise RuntimeError("k3s ещё не установлен")
+    if on_line:
+        on_line("Останавливаю медиасервер")
+    scale_stack(0, on_line)
+
+
+def start_media_server(on_line=None) -> None:
+    """Возвращает остановленные контейнеры и ждёт их готовности."""
+    if not k3s_installed():
+        raise RuntimeError("k3s ещё не установлен")
+    if on_line:
+        on_line("Запускаю медиасервер")
+    scale_stack(1, on_line)
+    wait_for_pods(on_line=on_line)
+
+
 def _release_volumes(on_line=None) -> None:
     """Снимает заявки и тома. Данные остаются: у всех томов политика Retain."""
     kubectl("delete", "pvc", "--all", "-n", "media", "--timeout=120s",
@@ -787,7 +859,8 @@ def monitoring_installed() -> bool:
     именно кластер: иначе окно предложит удалить то, чего нет, или промолчит про
     то, что осталось работать.
     """
-    return kubectl("get", "namespace", MONITORING_NS, timeout=60).returncode == 0
+    return k3s_installed() and \
+        kubectl("get", "namespace", MONITORING_NS, timeout=60).returncode == 0
 
 
 def remove_monitoring(on_line=None) -> subprocess.CompletedProcess:
@@ -805,8 +878,8 @@ def remove_monitoring(on_line=None) -> subprocess.CompletedProcess:
 
 
 def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
-            drop_monitoring: bool = False, qbt_login: str = "",
-            qbt_password: str = "") -> dict:
+            drop_monitoring: bool = False, media_login: str = "",
+            media_password: str = "") -> dict:
     """Полная установка. Возвращает то, что нужно показать человеку.
 
     drop_monitoring ставит окно, когда человек переключился с полного профиля на
@@ -831,7 +904,9 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
     # Namespace нужен раньше Secret'а и томов — они оба в него кладутся.
     kubectl("apply", "-f", str(bundle_root() / "k8s" / "media-stack"
                                / "00-namespace.yaml"), on_line=on_line)
-    password = create_qbittorrent_secret(on_line, qbt_login, qbt_password)
+    password = create_qbittorrent_secret(on_line)
+    if password:
+        prepare_qbittorrent_config(config_dir, config.QBT_DEFAULT_LOGIN, password, on_line)
     apply_volumes(config_dir, media_dir, on_line)
     result = apply_stack(on_line)
     if result.returncode == 0:
@@ -856,7 +931,7 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
     # логин при чужом пароле не открыл бы ничего.
     if password:
         config.save_state(qbittorrent_password=password,
-                          qbittorrent_login=qbt_login or config.QBT_DEFAULT_LOGIN)
+                          qbittorrent_login=config.QBT_DEFAULT_LOGIN)
 
     # Связываем сервисы сразу: между «установлено» и «можно смотреть» иначе лежит
     # полчаса ручной работы в четырёх чужих интерфейсах. Не получилось — не повод
@@ -867,6 +942,14 @@ def install(profile_key: str, config_dir: Path, media_dir: Path, on_line=None,
         if on_line:
             on_line("Связываю сервисы между собой")
         steps = wire.configure(config_dir, on_line=on_line)
+        if media_login and media_password:
+            if on_line:
+                on_line("Создаю единый аккаунт и настраиваю окно заказов")
+            account_steps = wire.configure_account(
+                config_dir, media_login, media_password, on_line=on_line)
+            steps.extend(account_steps)
+            if all(step.ok for step in account_steps):
+                config.save_state(media_login=media_login)
 
     return {
         "ok": result.returncode == 0,
@@ -1080,9 +1163,16 @@ def _self_check() -> None:
     # Ожидание узла. Проверяем именно то, из-за чего e2e падал на ровном месте:
     # узел появляется не сразу, а kubectl wait по несуществующему ресурсу
     # выходит мгновенно. Внешних команд тут нет — kubectl и sleep подменены.
-    global kubectl
-    real_kubectl, real_sleep = kubectl, time.sleep
+    global kubectl, k3s_installed
+    real_kubectl, real_k3s_installed, real_sleep = kubectl, k3s_installed, time.sleep
     seen: list[tuple] = []
+
+    # На чистой машине окно спрашивает про прежний мониторинг ещё до установки
+    # k3s. Отсутствие команды означает «мониторинга нет», а не аварию callback.
+    k3s_installed = lambda: False
+    kubectl = lambda *_a, **_kw: (_ for _ in ()).throw(
+        AssertionError("kubectl вызван до установки k3s"))
+    assert monitoring_installed() is False
 
     def fake(*args, **_kw):
         seen.append(args)
@@ -1091,7 +1181,7 @@ def _self_check() -> None:
         out = "" if args[0] == "get" and len(gets) < 3 else "node/home"
         return subprocess.CompletedProcess(args, 0, out)
 
-    kubectl, time.sleep = fake, lambda _s: None
+    kubectl, k3s_installed, time.sleep = fake, real_k3s_installed, lambda _s: None
     try:
         wait_for_node(timeout=60)
         assert len([c for c in seen if c[0] == "get"]) == 3, seen
@@ -1109,8 +1199,22 @@ def _self_check() -> None:
             raise AssertionError("пустой список узлов принят за готовый кластер")
         assert not [c for c in seen if c[0] == "wait"], \
             "kubectl wait вызван по несуществующему узлу — ровно то, что чинили"
+
+        # Явная пауза медиасервера сохраняет тома и настройки: выключаются только
+        # поды. Повторный запуск возвращает их и дожидается готовности.
+        k3s_installed = lambda: True
+        kubectl = fake
+        seen.clear()
+        stop_media_server()
+        assert any(c[0] == "scale" and "--replicas=0" in c for c in seen), seen
+        assert any(c[0] == "wait" and "--for=delete" in c for c in seen), seen
+
+        seen.clear()
+        start_media_server()
+        assert any(c[0] == "scale" and "--replicas=1" in c for c in seen), seen
+        assert any(c[0] == "wait" and "--for=condition=Ready" in c for c in seen), seen
     finally:
-        kubectl, time.sleep = real_kubectl, real_sleep
+        kubectl, k3s_installed, time.sleep = real_kubectl, real_k3s_installed, real_sleep
 
     # Пункт меню собирается без обращения к диску: подстановка не должна оставлять
     # незаполненных мест, а имя класса — расходиться с тем, что ставит окно.
@@ -1154,6 +1258,37 @@ def _self_check() -> None:
     hashed = qbittorrent_pbkdf2("проверка")
     assert hashed.startswith("@ByteArray(") and hashed.endswith(")")
     assert len(generate_password()) == 20
+
+    # Повторная установка может встретить конфиг от прежней попытки. Новый
+    # пароль из Secret обязан доехать и туда, иначе окно покажет нерабочий пароль.
+    with tempfile.TemporaryDirectory() as tmp:
+        config_dir = Path(tmp)
+        qbt_config = config_dir / "qbittorrent/qBittorrent/qBittorrent.conf"
+        qbt_config.parent.mkdir(parents=True)
+        qbt_config.write_text(
+            "[Preferences]\nWebUI\\Username=old\n"
+            'WebUI\\Password_PBKDF2="@ByteArray(old:hash)"\n'
+            "WebUI\\Port=8080\n",
+            encoding="utf-8",
+        )
+        real_urandom = os.urandom
+        os.urandom = lambda _size: bytes(range(16))
+        commands: list[tuple] = []
+        real_kubectl = kubectl
+        kubectl = lambda *args, **_kw: (
+            commands.append(args) or subprocess.CompletedProcess(args, 0, ""))
+        try:
+            prepare_qbittorrent_config(config_dir, "new", "new-pass")
+        finally:
+            os.urandom = real_urandom
+            kubectl = real_kubectl
+        synced = qbt_config.read_text(encoding="utf-8")
+        assert commands[0][0] == "scale" and "--replicas=0" in commands[0], commands
+        assert commands[1][0] == "wait" and "--for=delete" in commands[1], commands
+        assert "WebUI\\Username=new" in synced
+        assert "@ByteArray(old:hash)" not in synced
+        assert "WebUI\\Port=8080" in synced, "чужая настройка потерялась"
+        assert "N8vsGC4iHgyvNWAnPPYBkH3LrLJnf50/" in synced
     print("install.py self-check: OK")
 
 

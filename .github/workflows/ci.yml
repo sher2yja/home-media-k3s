@@ -460,14 +460,17 @@ jobs:
           sys.path.insert(0, 'app')
           import config, install
           home = pathlib.Path.home()
-          # Свой логин, а не умолчание: только так проверяется дорога
-          # «поле в окне -> Secret -> initContainer -> конфиг qBittorrent».
-          # С admin она неотличима от прежнего поведения.
+          # Один пользовательский аккаунт должен доехать в Jellyfin и Jellyseerr;
+          # технический пароль qBittorrent установщик создаёт сам.
           result = install.install('simple', home / 'hm-config', home / 'hm-media',
-                                   on_line=print, qbt_login='kinoman')
+                                   on_line=print, media_login='viewer',
+                                   media_password='Media-Proverka-77')
           assert result['ok'], 'установка вернула ok=False'
           assert result['qbittorrent_password'], 'пароль торрента не создан'
-          assert config.qbittorrent_login() == 'kinoman', config.qbittorrent_login()
+          assert config.qbittorrent_login() == 'admin', config.qbittorrent_login()
+          assert config.load_state()['media_login'] == 'viewer'
+          failed = [step for step in result['steps'] if not step.ok]
+          assert not failed, f'автонастройка не завершилась: {failed}'
           PY
 
       # install.install() уже дождался связывания и упал бы, если бы его не было.
@@ -498,6 +501,23 @@ jobs:
           for s in statuses:
               print(f"{s['title']}: {s['text']}")
           assert all(s['alive'] for s in statuses), 'не все сервисы отвечают'
+          PY
+
+      - name: Единый аккаунт и Jellyseerr настроены
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, 'app')
+          import media, wire
+          assert media.jellyfin_login('viewer', 'Media-Proverka-77'), 'Jellyfin не принял аккаунт'
+          client = wire._Jellyseerr()
+          code, _ = client.request('/auth/jellyfin', data={
+              'username': 'viewer', 'password': 'Media-Proverka-77'})
+          assert code == 200, f'Jellyseerr не принял аккаунт: {code}'
+          for service in ('sonarr', 'radarr'):
+              code, servers = client.request(f'/settings/{service}')
+              assert code == 200 and len(servers) == 1, (service, code, servers)
+          print('один аккаунт открывает Jellyfin и Jellyseerr; Sonarr/Radarr подключены')
           PY
 
       # Единственное место, где API Sonarr, Radarr и Prowlarr проверяются
